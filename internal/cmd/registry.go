@@ -13,6 +13,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -41,6 +42,12 @@ var commands = map[string]CmdFunc{
 	"GET":    Get,
 	"DEL":    Del,
 	"EXISTS": Exists,
+	"LPUSH":  LPush,
+	"RPUSH":  RPush,
+	"LPOP":   LPop,
+	"RPOP":   RPop,
+	"LRANGE": LRange,
+	"LLEN":   LLen,
 }
 
 // Dispatch routes a decoded client request to the right handler and returns the
@@ -117,4 +124,27 @@ func nullBulkValue() protocol.Value {
 // wrong number of arguments. name is lower-cased to match Redis's own wording.
 func wrongArgs(name string) protocol.Value {
 	return errorValue(fmt.Sprintf("ERR wrong number of arguments for '%s' command", name))
+}
+
+// arrayValue builds a RESP array reply from already-constructed element Values
+// (used by LRANGE). A non-nil but empty slice encodes as the empty array "*0",
+// which is what Redis returns for, e.g., LRANGE on a missing key.
+func arrayValue(items []protocol.Value) protocol.Value {
+	return protocol.Value{Type: protocol.TypeArray, Array: items}
+}
+
+// notInteger is Redis's standard error for a numeric argument that does not
+// parse as an integer (e.g. the start/stop indices of LRANGE).
+func notInteger() protocol.Value {
+	return errorValue("ERR value is not an integer or out of range")
+}
+
+// replyForErr maps a store error to the matching RESP error reply. A type
+// mismatch becomes the canonical WRONGTYPE error (the wording real Redis uses,
+// which interview tests check for); anything else is surfaced as a generic ERR.
+func replyForErr(err error) protocol.Value {
+	if errors.Is(err, db.ErrWrongType) {
+		return errorValue("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	return errorValue("ERR " + err.Error())
 }

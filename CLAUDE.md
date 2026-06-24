@@ -42,24 +42,29 @@ _Last updated: 2026-06-18._
 ### Implemented
 - **RESP2 protocol** (`internal/protocol`): decoder, encoder, value model, with
   parser tests. Binary-safe bulk strings.
-- **In-memory store** (`internal/db/db.go`): `DB` guarded by an `RWMutex`;
-  `Get`/`Set`/`Del`/`Exists` over `[]byte` values.
+- **Typed in-memory store** (`internal/db/`): `DB` guarded by an `RWMutex`,
+  keyed to `*Entry` values (`entry.go`) that carry a type tag (string or list)
+  plus an `expireAt` field reserved for future expiry. Operations are
+  type-checked and return `ErrWrongType` on a mismatch.
 - **Command dispatch** (`internal/cmd/registry.go`): case-insensitive name
   lookup → handler → RESP reply. Registered commands:
-  `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`.
+  - Generic/string: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`
+  - Lists (`internal/cmd/list.go`): `LPUSH`, `RPUSH`, `LPOP`, `RPOP`,
+    `LRANGE`, `LLEN` — slice-backed lists, negative-index `LRANGE`, empty-list
+    keys auto-deleted, and `WRONGTYPE` enforced across types.
 - **Server** (`internal/server`): TCP accept loop, one goroutine per
   connection, graceful shutdown on SIGINT/SIGTERM (context-cancel closes the
   listener and drains in-flight connections).
 - **Entrypoint** (`cmd/server/main.go`): `--port` flag (default `6380`).
-- **Integration tests** (`tests/integration/basic_test.go`): drive the server
-  over TCP with the upstream `go-redis/v9` client (PING, SET/GET, missing-key
-  `redis.Nil`, DEL).
+- **Tests**: `internal/cmd` unit tests (dispatch, lists, WRONGTYPE) and
+  `tests/integration/` end-to-end coverage driven by the upstream `go-redis/v9`
+  client (`basic_test.go`, `list_test.go`).
 
 ### Scaffolded (not yet implemented — empty stub files)
-- Commands: `EXPIRE`, hashes, lists, sets, pub/sub, replication
-  (`internal/cmd/{expire,hash,list,set,pubsub,replication}.go`).
-- Store internals: `entry`, `expiry`, `pubsub`, `shard`
-  (`internal/db/`).
+- Commands: `EXPIRE`, hashes, sets, pub/sub, replication
+  (`internal/cmd/{expire,hash,set,pubsub,replication}.go`).
+- Store internals: `expiry`, `pubsub`, `shard` (`internal/db/`). The `Entry`
+  type carries an `expireAt` field, but no command sets or enforces it yet.
 - Persistence / AOF: `internal/persistence/{aof,replay,rewrite}.go`.
 - Replication: `internal/replication/{primary,replica}.go`.
 - Metrics: `internal/metrics/metrics.go`.

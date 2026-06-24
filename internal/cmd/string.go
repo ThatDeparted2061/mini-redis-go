@@ -30,13 +30,17 @@ func Set(database *db.DB, args []protocol.Value) protocol.Value {
 //
 // It replies with the stored value as a bulk string, or with a null bulk string
 // ("$-1") if the key does not exist — that null is how a Redis client learns the
-// key is absent, as distinct from a key holding an empty value.
+// key is absent, as distinct from a key holding an empty value. If the key holds
+// a non-string (e.g. a list) it replies WRONGTYPE, since GET is string-only.
 func Get(database *db.DB, args []protocol.Value) protocol.Value {
 	if len(args) != 1 {
 		return wrongArgs("get")
 	}
 
-	value, ok := database.Get(string(args[0].Bulk))
+	value, ok, err := database.Get(string(args[0].Bulk))
+	if err != nil {
+		return replyForErr(err)
+	}
 	if !ok {
 		return nullBulkValue()
 	}

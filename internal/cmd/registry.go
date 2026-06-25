@@ -67,6 +67,38 @@ var commands = map[string]CmdFunc{
 	"PERSIST":   Persist,
 }
 
+// writeCommands names every command that MUTATES the keyspace, and so must be
+// recorded in the append-only log to survive a restart. Read-only commands (GET,
+// LRANGE, TTL, PING, ...) are intentionally absent: persisting them would be
+// wasted work on replay and buys nothing, since they change no state.
+//
+// Keep this in lock-step with `commands` above: a new write handler added there
+// must be listed here too, or its effect will silently vanish on restart.
+var writeCommands = map[string]struct{}{
+	"SET":     {},
+	"DEL":     {},
+	"LPUSH":   {},
+	"RPUSH":   {},
+	"LPOP":    {},
+	"RPOP":    {},
+	"HSET":    {},
+	"HDEL":    {},
+	"SADD":    {},
+	"SREM":    {},
+	"EXPIRE":  {},
+	"PEXPIRE": {},
+	"PERSIST": {},
+}
+
+// IsWrite reports whether name (in any case) is a write command — one whose
+// effect must be appended to the AOF. The server consults it after decoding a
+// request to decide whether the command needs persisting. Names are matched
+// case-insensitively, exactly as Dispatch resolves them.
+func IsWrite(name string) bool {
+	_, ok := writeCommands[strings.ToUpper(name)]
+	return ok
+}
+
 // Dispatch routes a decoded client request to the right handler and returns the
 // reply to send back.
 //

@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 
-	"github.com/ThatDeparted2061/mini-redis-go/internal/cmd"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
 
@@ -59,10 +58,11 @@ func (s *Server) handle(conn net.Conn) {
 			}
 		}
 
-		// 2. DISPATCH: look up the command and run it. Dispatch always returns
-		//    a Value to send back — a normal reply or a RESP error — so command
+		// 2. DISPATCH: look up the command and run it, persisting it to the AOF
+		//    first if it is a successful write (see apply). apply always returns a
+		//    Value to send back — a normal reply or a RESP error — so command
 		//    failures never break the loop.
-		reply := cmd.Dispatch(s.db, request)
+		reply := s.apply(request)
 
 		// 3. ENCODE the reply and flush it to the client. An error here means
 		//    the connection is broken (peer gone, write timeout, ...), so we

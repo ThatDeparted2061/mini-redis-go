@@ -51,7 +51,7 @@ Keep the summary truthful: an empty stub file is "scaffolded", not "done".
 
 ## Project status
 
-_Last updated: 2026-06-25._
+_Last updated: 2026-06-26._
 
 ### Implemented
 - **RESP2 protocol** (`internal/protocol`): decoder, encoder, value model, with
@@ -83,20 +83,37 @@ _Last updated: 2026-06-25._
   connection, graceful shutdown on SIGINT/SIGTERM (context-cancel closes the
   listener and drains in-flight connections). Launches the active-expiry reaper
   for the server's lifetime and waits for it on shutdown.
-- **Entrypoint** (`cmd/server/main.go`): `--port` flag (default `6380`).
+- **Persistence — append-only file** (`internal/persistence/{aof,replay}.go`):
+  durability by logging the COMMAND, not the resulting state. On startup the
+  server replays the log (`persistence.Replay`) by re-dispatching each recorded
+  command through the normal `cmd.Dispatch` path, rebuilding state from history;
+  while serving, every successful write (`cmd.IsWrite`) is appended in RESP wire
+  format (`persistence.AOF`, a `bufio.Writer` over an `*os.File`) and flushed to
+  the OS, so writes survive a `kill -9`. The apply-then-append of a write is
+  serialised by the server's `writeMu` so the log's order matches the order the
+  store applied them; reads stay lock-free of it. Replay tolerates a truncated
+  trailing command (a torn tail from a crash) and a missing file. Failed writes
+  (WRONGTYPE, bad args) are not logged.
+- **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
+  `--appendonly` (default `true`) and `--aof-path` (default `appendonly.aof`).
 - **Tests**: `internal/cmd` unit tests (dispatch, lists, hashes, sets, expiry,
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
-  resurrection of expired keys on write), and `tests/integration/` end-to-end
-  coverage driven by the upstream `go-redis/v9` client (`basic_test.go`,
-  `list_test.go`, `hash_test.go`, `set_test.go`, `expire_test.go`).
+  resurrection of expired keys on write), `internal/persistence` unit tests
+  (append/replay round-trip, missing file, truncated-tail tolerance), and
+  `tests/integration/` end-to-end coverage driven by the upstream `go-redis/v9`
+  client (`basic_test.go`, `list_test.go`, `hash_test.go`, `set_test.go`,
+  `expire_test.go`, and `aof_test.go` — cross-restart durability, failed writes
+  not persisted, and concurrent-write replay ordering).
 
 ### Scaffolded (not yet implemented — empty stub files)
 - Commands: pub/sub, replication (`internal/cmd/{pubsub,replication}.go`).
 - Store internals: `pubsub`, `shard` (`internal/db/`).
-- Persistence / AOF: `internal/persistence/{aof,replay,rewrite}.go`.
+- AOF rewrite / compaction: `internal/persistence/rewrite.go`. The log only
+  grows today (every write is appended forever); rewrite will compact it to the
+  minimal command set that reproduces the current state.
 - Replication: `internal/replication/{primary,replica}.go`.
 - Metrics: `internal/metrics/metrics.go`.
-- Tests: `tests/integration/{aof,replication}_test.go`, `tests/chaos/*`.
+- Tests: `tests/integration/replication_test.go`, `tests/chaos/*`.
 
 ### Known gaps (intentionally unimplemented)
 - **Sorted sets** (`ZADD`, `ZRANGE`, `ZSCORE`, …) are deliberately skipped.
@@ -114,13 +131,17 @@ _Last updated: 2026-06-25._
 Request flow for one client command:
 
 ```
-TCP conn → protocol.Decode → cmd.Dispatch → handler(db, args) → protocol.Encode → TCP conn
+TCP conn → protocol.Decode → server.apply ┬→ cmd.Dispatch → handler(db, args) ┐
+                                           └→ (write & ok) AOF append           │
+                                                          protocol.Encode → TCP conn
 ```
 
 Handlers never touch the socket or RESP wire format; they receive decoded
 arguments and return a `protocol.Value`. There is exactly one shared `db.DB`
-for the whole process — all concurrency safety lives inside its `RWMutex`, so
-the server holds no locks of its own.
+for the whole process — all keyspace concurrency safety lives inside its
+`RWMutex`. The server adds one lock of its own, `writeMu`, held only on the
+write path so a command's database mutation and its AOF append happen as a unit
+and the log's order matches the store's; reads never take it.
 
 ## Build / test / run
 

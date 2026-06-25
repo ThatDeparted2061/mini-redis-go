@@ -4,5 +4,8 @@ data/
 .idea/
 .vscode/
 
+# append-only persistence files (runtime state, not source)
+*.aof
+
 # graphify knowledge-graph output (deployed via gh-pages, not source)
 graphify-out/

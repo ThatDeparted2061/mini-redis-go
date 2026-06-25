@@ -6,30 +6,65 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
 
+	"github.com/ThatDeparted2061/mini-redis-go/internal/cmd"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/persistence"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
 
 // Server owns the TCP listener and the one shared database used by every
 // connection. There is exactly one DB instance for the whole process; all
 // concurrency safety lives inside db.DB (its RWMutex), so the Server itself
-// holds no locks and stays oblivious to keys.
+// holds no locks of its own for the keyspace.
+//
+// When persistence is enabled (aofPath set) the Server also owns the append-only
+// log: it replays the log on startup to rebuild state, appends every successful
+// write to it while serving, and closes it on shutdown. writeMu serialises that
+// append against the database mutation it records — see apply.
 type Server struct {
 	ln net.Listener
 	db *db.DB
+
+	// aofPath is the append-only log's path, or "" to run without persistence.
+	// aof is the open log, set during Serve once aofPath has been replayed.
+	aofPath string
+	aof     *persistence.AOF
+
+	// writeMu serialises the apply-then-append of write commands so the order
+	// commands are recorded in the AOF matches the order the db applied them.
+	// See apply for why that invariant matters.
+	writeMu sync.Mutex
+}
+
+// Option configures a Server at construction time. Options keep New backward
+// compatible: callers that want the default (no persistence) pass none.
+type Option func(*Server)
+
+// WithAOF enables append-only persistence, using the log file at path. On Serve
+// the server replays this file to recover prior state, then appends new writes to
+// it. An empty path is treated as "persistence disabled".
+func WithAOF(path string) Option {
+	return func(s *Server) { s.aofPath = path }
 }
 
 // New builds a Server around an already-open listener and a fresh, empty
 // database. The caller owns creating the listener (so it controls the address,
-// and so listen errors surface in main before we start serving).
-func New(ln net.Listener) *Server {
-	return &Server{
+// and so listen errors surface in main before we start serving). Options enable
+// optional features such as persistence (WithAOF).
+func New(ln net.Listener, opts ...Option) *Server {
+	s := &Server{
 		ln: ln,
 		db: db.New(),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Serve runs the accept loop until ctx is cancelled (or the listener is closed
@@ -40,6 +75,17 @@ func New(ln net.Listener) *Server {
 // clients never block others. The shared db.DB makes that safe: concurrent
 // handlers serialise only through its lock.
 func (s *Server) Serve(ctx context.Context) error {
+	// Persistence comes first, before a single client is accepted: replay the
+	// existing log to rebuild prior state, then open it for appending. Doing this
+	// up front means recovery runs against a quiescent database (no connections,
+	// no reaper yet) and the very first client write lands in an already-open log.
+	if s.aofPath != "" {
+		if err := s.loadAOF(); err != nil {
+			return err
+		}
+		defer s.aof.Close()
+	}
+
 	// When the context is cancelled (e.g. on SIGINT) close the listener. That
 	// makes the blocking Accept below return immediately with ErrClosed, which
 	// is how we break out of the loop cleanly instead of polling.
@@ -87,4 +133,78 @@ func (s *Server) Serve(ctx context.Context) error {
 	wg.Wait()
 	<-expiryDone
 	return nil
+}
+
+// loadAOF replays the append-only log at s.aofPath to rebuild state, then opens
+// it for appending and stores it in s.aof, ready for the write path.
+//
+// Replaying re-executes each logged command through the ordinary dispatcher —
+// the exact code that first ran it — so recovered state is correct by
+// construction rather than by a separately-maintained loader. A command that now
+// replies with an error is logged and skipped rather than aborting recovery: one
+// unreadable frame should not strand every good write before it.
+func (s *Server) loadAOF() error {
+	n, err := persistence.Replay(s.aofPath, func(c protocol.Value) error {
+		if reply := cmd.Dispatch(s.db, c); reply.Type == protocol.TypeError {
+			log.Printf("aof replay: %q replied %q (skipped)", commandName(c), reply.Str)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("aof replay %s: %w", s.aofPath, err)
+	}
+	if n > 0 {
+		log.Printf("aof: recovered %d command(s) from %s", n, s.aofPath)
+	}
+
+	aof, err := persistence.Open(s.aofPath)
+	if err != nil {
+		return fmt.Errorf("aof open %s: %w", s.aofPath, err)
+	}
+	s.aof = aof
+	return nil
+}
+
+// apply runs request against the shared database and, when persistence is on and
+// the command both writes and succeeds, appends it to the log.
+//
+// The write path holds writeMu across BOTH the dispatch and the append. That is
+// the crux of correctness under concurrency: handlers run in many goroutines, and
+// without this lock two writers could mutate the database in one order yet reach
+// the log in the other — a replay would then rebuild a DIFFERENT state than the
+// one that was live. Holding writeMu makes "apply then record" atomic per write,
+// so the log's order always matches the database's. Reads never take writeMu, so
+// they still run fully in parallel under the database's own read lock.
+//
+// Only non-error replies are logged: a command that failed (wrong arguments,
+// WRONGTYPE, ...) changed nothing, so there is nothing to persist.
+func (s *Server) apply(request protocol.Value) protocol.Value {
+	if s.aof == nil || !cmd.IsWrite(commandName(request)) {
+		return cmd.Dispatch(s.db, request)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	reply := cmd.Dispatch(s.db, request)
+	if reply.Type != protocol.TypeError {
+		if err := s.aof.Append(request); err != nil {
+			// The mutation already happened in memory; we just failed to make it
+			// durable. Surface it loudly — a later crash would lose this write —
+			// but still return the reply the client earned.
+			log.Printf("aof append failed for %q: %v", commandName(request), err)
+		}
+	}
+	return reply
+}
+
+// commandName extracts the command name from a decoded request, or "" if the
+// request is not a well-formed command array. IsWrite("") is false and Dispatch
+// rejects the same malformed shapes, so a "" here simply routes to the normal
+// (non-persisted) error path.
+func commandName(request protocol.Value) string {
+	if request.Type != protocol.TypeArray || len(request.Array) == 0 {
+		return ""
+	}
+	return string(request.Array[0].Bulk)
 }

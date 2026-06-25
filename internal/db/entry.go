@@ -12,6 +12,8 @@ type kind uint8
 const (
 	kindString kind = iota // value lives in Entry.str
 	kindList               // value lives in Entry.list
+	kindHash               // value lives in Entry.hash
+	kindSet                // value lives in Entry.set
 )
 
 // Entry is the value stored under a single key. It generalises the store from
@@ -25,7 +27,9 @@ const (
 // eviction on access) arrive in a later phase, so today it is always zero.
 type Entry struct {
 	kind     kind
-	str      []byte   // meaningful when kind == kindString
-	list     [][]byte // meaningful when kind == kindList (index 0 is the head)
+	str      []byte              // meaningful when kind == kindString
+	list     [][]byte            // meaningful when kind == kindList (index 0 is the head)
+	hash     map[string][]byte   // meaningful when kind == kindHash (field -> value)
+	set      map[string]struct{} // meaningful when kind == kindSet (struct{} is a value-less placeholder)
 	expireAt time.Time
 }

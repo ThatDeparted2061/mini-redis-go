@@ -124,10 +124,5 @@ func LRange(database *db.DB, args []protocol.Value) protocol.Value {
 	if err != nil {
 		return replyForErr(err)
 	}
-
-	out := make([]protocol.Value, len(items))
-	for i, it := range items {
-		out[i] = bulkValue(it)
-	}
-	return arrayValue(out)
+	return bulkArrayValue(items)
 }

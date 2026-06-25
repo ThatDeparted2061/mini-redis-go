@@ -49,6 +49,17 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.ln.Close()
 	}()
 
+	// Active expiry runs for the server's lifetime, reclaiming keys whose TTL
+	// elapsed without being accessed (lazy expiry alone would leak those). It
+	// stops when ctx is cancelled; we wait for it on the way out so no background
+	// goroutine outlives Serve. This is the spec's `go db.RunActiveExpiry(ctx)`,
+	// placed where the db and the lifecycle context actually live.
+	expiryDone := make(chan struct{})
+	go func() {
+		defer close(expiryDone)
+		s.db.RunActiveExpiry(ctx)
+	}()
+
 	// wg tracks live connection goroutines so we can wait them out on shutdown
 	// rather than yanking the process out from under in-flight requests.
 	var wg sync.WaitGroup
@@ -74,5 +85,6 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	wg.Wait()
+	<-expiryDone
 	return nil
 }

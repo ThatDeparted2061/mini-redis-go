@@ -36,18 +36,35 @@ type CmdFunc func(database *db.DB, args []protocol.Value) protocol.Value
 // the table only needs the canonical form. New commands are wired in by adding
 // a line here and writing the handler in one of the sibling files.
 var commands = map[string]CmdFunc{
-	"PING":   Ping,
-	"ECHO":   Echo,
-	"SET":    Set,
-	"GET":    Get,
-	"DEL":    Del,
-	"EXISTS": Exists,
-	"LPUSH":  LPush,
-	"RPUSH":  RPush,
-	"LPOP":   LPop,
-	"RPOP":   RPop,
-	"LRANGE": LRange,
-	"LLEN":   LLen,
+	"PING":      Ping,
+	"ECHO":      Echo,
+	"SET":       Set,
+	"GET":       Get,
+	"DEL":       Del,
+	"EXISTS":    Exists,
+	"LPUSH":     LPush,
+	"RPUSH":     RPush,
+	"LPOP":      LPop,
+	"RPOP":      RPop,
+	"LRANGE":    LRange,
+	"LLEN":      LLen,
+	"HSET":      HSet,
+	"HGET":      HGet,
+	"HDEL":      HDel,
+	"HGETALL":   HGetAll,
+	"HKEYS":     HKeys,
+	"HVALS":     HVals,
+	"HLEN":      HLen,
+	"SADD":      SAdd,
+	"SREM":      SRem,
+	"SISMEMBER": SIsMember,
+	"SMEMBERS":  SMembers,
+	"SCARD":     SCard,
+	"EXPIRE":    Expire,
+	"PEXPIRE":   PExpire,
+	"TTL":       TTL,
+	"PTTL":      PTTL,
+	"PERSIST":   Persist,
 }
 
 // Dispatch routes a decoded client request to the right handler and returns the
@@ -108,6 +125,16 @@ func integerValue(n int64) protocol.Value {
 	return protocol.Value{Type: protocol.TypeInteger, Int: n}
 }
 
+// boolReply maps a Go bool to the RESP integer reply Redis uses for boolean
+// outcomes: 1 for true, 0 for false (e.g. EXPIRE set / not set, PERSIST,
+// SISMEMBER).
+func boolReply(b bool) protocol.Value {
+	if b {
+		return integerValue(1)
+	}
+	return integerValue(0)
+}
+
 // bulkValue builds a RESP bulk string from arbitrary bytes — the binary-safe
 // reply type used to return stored values and echoed payloads.
 func bulkValue(b []byte) protocol.Value {
@@ -137,6 +164,17 @@ func arrayValue(items []protocol.Value) protocol.Value {
 // parse as an integer (e.g. the start/stop indices of LRANGE).
 func notInteger() protocol.Value {
 	return errorValue("ERR value is not an integer or out of range")
+}
+
+// bulkArrayValue builds a RESP array whose elements are bulk strings — the reply
+// shape shared by LRANGE, HKEYS, HVALS, and SMEMBERS. A non-nil empty input
+// encodes as the empty array "*0".
+func bulkArrayValue(items [][]byte) protocol.Value {
+	out := make([]protocol.Value, len(items))
+	for i, it := range items {
+		out[i] = bulkValue(it)
+	}
+	return arrayValue(out)
 }
 
 // replyForErr maps a store error to the matching RESP error reply. A type

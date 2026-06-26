@@ -32,8 +32,11 @@ type Server struct {
 
 	// aofPath is the append-only log's path, or "" to run without persistence.
 	// aof is the open log, set during Serve once aofPath has been replayed.
-	aofPath string
-	aof     *persistence.AOF
+	// fsyncMode is the log's durability policy; its zero value is FsyncEverySec,
+	// so a server with no WithFsync option gets the sensible default.
+	aofPath   string
+	fsyncMode persistence.FsyncMode
+	aof       *persistence.AOF
 
 	// writeMu serialises the apply-then-append of write commands so the order
 	// commands are recorded in the AOF matches the order the db applied them.
@@ -50,6 +53,12 @@ type Option func(*Server)
 // it. An empty path is treated as "persistence disabled".
 func WithAOF(path string) Option {
 	return func(s *Server) { s.aofPath = path }
+}
+
+// WithFsync sets the AOF's fsync policy (durability vs. throughput). It only
+// matters alongside WithAOF; with no AOF there is nothing to fsync.
+func WithFsync(mode persistence.FsyncMode) Option {
+	return func(s *Server) { s.fsyncMode = mode }
 }
 
 // New builds a Server around an already-open listener and a fresh, empty
@@ -157,7 +166,7 @@ func (s *Server) loadAOF() error {
 		log.Printf("aof: recovered %d command(s) from %s", n, s.aofPath)
 	}
 
-	aof, err := persistence.Open(s.aofPath)
+	aof, err := persistence.Open(s.aofPath, s.fsyncMode)
 	if err != nil {
 		return fmt.Errorf("aof open %s: %w", s.aofPath, err)
 	}

@@ -11,17 +11,21 @@
 // second serialization format to keep in sync with the live data structures, and
 // no way for the on-disk shape to drift from the in-memory one.
 //
-// Durability today is "survive a process crash" (e.g. kill -9): every Append
-// flushes the buffered bytes out to the operating system, so a killed process
-// leaves a complete log behind. Surviving a power loss (an explicit fsync to the
-// physical disk) and batching flushes for throughput are the next step and are
-// deliberately not here yet.
+// Every Append flushes the buffered bytes out to the operating system, so a
+// killed process (kill -9) always leaves a complete log behind — the kernel
+// still owns the bytes and writes them back. Surviving a whole-machine POWER
+// LOSS is stronger: it needs an fsync, which pushes the kernel's page cache to
+// the physical disk. How often we pay that fsync is the FsyncMode policy below —
+// the canonical durability/throughput trade-off (see the README).
 package persistence
 
 import (
 	"bufio"
+	"fmt"
+	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
@@ -29,6 +33,52 @@ import (
 // DefaultFilename is the conventional name for the log, matching Redis's own
 // appendonly.aof so the file is recognisable.
 const DefaultFilename = "appendonly.aof"
+
+// FsyncMode decides how often the log is fsync'd to the physical disk — the
+// trade-off between how much a crash can lose and how fast writes are.
+type FsyncMode int
+
+const (
+	// FsyncEverySec fsyncs once a second from a background ticker. A crash loses
+	// at most ~1s of writes; the write path itself never blocks on the disk.
+	// This is the default (and Redis's), and the zero value so a Server with no
+	// fsync option gets it for free.
+	FsyncEverySec FsyncMode = iota
+	// FsyncAlways fsyncs after every command. A crash loses at most the one
+	// in-flight write, at the cost of a disk sync (~1ms on an SSD) per write.
+	FsyncAlways
+	// FsyncNo never explicitly fsyncs; it relies on the OS to flush its page
+	// cache on its own schedule (~30s on Linux). Fastest, least durable.
+	FsyncNo
+)
+
+func (m FsyncMode) String() string {
+	switch m {
+	case FsyncAlways:
+		return "always"
+	case FsyncEverySec:
+		return "everysec"
+	case FsyncNo:
+		return "no"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseFsyncMode maps a CLI flag value ("always" | "everysec" | "no") to a
+// FsyncMode, erroring on anything else.
+func ParseFsyncMode(s string) (FsyncMode, error) {
+	switch s {
+	case "always":
+		return FsyncAlways, nil
+	case "everysec":
+		return FsyncEverySec, nil
+	case "no":
+		return FsyncNo, nil
+	default:
+		return 0, fmt.Errorf("invalid appendfsync %q (want always, everysec, or no)", s)
+	}
+}
 
 // AOF is a concurrency-safe append-only command log.
 //
@@ -40,9 +90,15 @@ const DefaultFilename = "appendonly.aof"
 // concurrent use and, just as importantly, because the bytes for two commands
 // must never interleave in the file.
 type AOF struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *bufio.Writer
+	mu   sync.Mutex
+	f    *os.File
+	w    *bufio.Writer
+	mode FsyncMode
+
+	// stop/done drive the everysec ticker goroutine: Close closes stop to ask it
+	// to exit and waits on done. Both are nil in the other modes (no goroutine).
+	stop chan struct{}
+	done chan struct{}
 }
 
 // Open opens the AOF at path for appending, creating it if it does not exist.
@@ -52,23 +108,49 @@ type AOF struct {
 // it — exactly what we want across restarts: the prior history is preserved and
 // new commands accumulate after it. The caller is expected to Replay the file
 // first (to rebuild state) and only then Open it for appending.
-func Open(path string) (*AOF, error) {
+func Open(path string, mode FsyncMode) (*AOF, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &AOF{f: f, w: bufio.NewWriter(f)}, nil
+	a := &AOF{f: f, w: bufio.NewWriter(f), mode: mode}
+	if mode == FsyncEverySec {
+		a.stop = make(chan struct{})
+		a.done = make(chan struct{})
+		go a.syncEverySec()
+	}
+	return a, nil
+}
+
+// syncEverySec fsyncs the file once a second until Close stops it. It runs only
+// in FsyncEverySec mode. The fsync takes a.mu so it never races an Append's
+// flush; the cost lands here on a background goroutine, not on the write path.
+func (a *AOF) syncEverySec() {
+	defer close(a.done)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.stop:
+			return
+		case <-t.C:
+			a.mu.Lock()
+			err := a.f.Sync()
+			a.mu.Unlock()
+			if err != nil {
+				log.Printf("aof everysec fsync: %v", err)
+			}
+		}
+	}
 }
 
 // Append writes cmd — a RESP array such as ["SET","k","v"] — to the log and
 // flushes it out to the operating system before returning.
 //
-// Flushing on every call is the simplest durability policy: once Append returns,
-// the command is in the OS page cache, so even an immediate kill -9 of THIS
-// process cannot lose it (the kernel still owns the bytes and writes them back to
-// disk). It does not yet protect against the whole machine losing power between
-// the write and the kernel's writeback — that needs an fsync, which, along with a
-// less aggressive flush cadence for throughput, is a later refinement.
+// The flush puts the command in the OS page cache, so even an immediate kill -9
+// of THIS process cannot lose it. Surviving a power loss is the FsyncMode's job:
+// in FsyncAlways we fsync to disk here, before returning, so nothing acked is
+// lost; in everysec/no the fsync is deferred (to the ticker, or to the OS).
 func (a *AOF) Append(cmd protocol.Value) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -76,7 +158,13 @@ func (a *AOF) Append(cmd protocol.Value) error {
 	if err := protocol.Encode(a.w, cmd); err != nil {
 		return err
 	}
-	return a.w.Flush()
+	if err := a.w.Flush(); err != nil {
+		return err
+	}
+	if a.mode == FsyncAlways {
+		return a.f.Sync()
+	}
+	return nil
 }
 
 // Flush pushes any buffered bytes out to the operating system. With the current
@@ -89,18 +177,31 @@ func (a *AOF) Flush() error {
 	return a.w.Flush()
 }
 
-// Close flushes any remaining buffered bytes and closes the underlying file. It
-// reports the flush error in preference to the close error, since a failed flush
-// means data was lost, whereas a close error on an already-flushed file is
-// benign.
+// Close stops the everysec ticker (if any), flushes any buffered bytes, fsyncs,
+// and closes the underlying file. The fsync runs in every mode because a clean
+// shutdown is not a crash: a graceful stop should lose nothing, even in
+// everysec/no where the per-command path skips it. Errors are reported
+// flush-then-sync-then-close, since an earlier failure means more data lost.
 func (a *AOF) Close() error {
+	// Stop the ticker before touching the file so its fsync can't race the
+	// flush/close below. Done outside the lock: the goroutine takes a.mu itself.
+	if a.mode == FsyncEverySec {
+		close(a.stop)
+		<-a.done
+	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	flushErr := a.w.Flush()
+	syncErr := a.f.Sync()
 	closeErr := a.f.Close()
-	if flushErr != nil {
+	switch {
+	case flushErr != nil:
 		return flushErr
+	case syncErr != nil:
+		return syncErr
+	default:
+		return closeErr
 	}
-	return closeErr
 }

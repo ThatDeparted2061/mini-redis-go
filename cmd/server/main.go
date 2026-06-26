@@ -16,7 +16,13 @@ func main() {
 	port := flag.String("port", "6380", "TCP port to listen on")
 	appendOnly := flag.Bool("appendonly", true, "persist writes to an append-only file and recover them on restart")
 	aofPath := flag.String("aof-path", persistence.DefaultFilename, "path to the append-only file")
+	appendFsync := flag.String("appendfsync", "everysec", "AOF fsync policy: always | everysec | no")
 	flag.Parse()
+
+	fsyncMode, err := persistence.ParseFsyncMode(*appendFsync)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Open the listener here (not inside the server) so a bad address or a
 	// port-in-use error is reported before we claim to be "listening".
@@ -38,8 +44,8 @@ func main() {
 	// runs a purely in-memory server.
 	var opts []server.Option
 	if *appendOnly {
-		opts = append(opts, server.WithAOF(*aofPath))
-		log.Printf("append-only persistence on: %s", *aofPath)
+		opts = append(opts, server.WithAOF(*aofPath), server.WithFsync(fsyncMode))
+		log.Printf("append-only persistence on: %s (appendfsync=%s)", *aofPath, fsyncMode)
 	}
 
 	srv := server.New(ln, opts...)

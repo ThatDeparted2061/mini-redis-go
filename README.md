@@ -6,8 +6,8 @@ wire protocol (RESP2), so standard clients — `redis-cli` and
 in-memory key/value store.
 
 This is a learning project built in phases. It is intentionally simple where
-production Redis is complex (one global lock, no persistence yet), and it calls
-those simplifications out rather than hiding them.
+production Redis is complex (one global lock, single-format AOF persistence), and
+it calls those simplifications out rather than hiding them.
 
 ## Quick start
 
@@ -143,13 +143,47 @@ meaningful denominator for the 25% ratio); persistent keys are skipped.
   iteration, which is good enough for this purpose but is not the uniform random
   sampling Redis does from its expires dict.
 
+## Persistence (AOF) and the fsync trade-off
+
+Writes are made durable with an **append-only file (AOF)**: the server logs the
+*command* it just ran (e.g. `SET k v`), in the exact RESP bytes the client sent,
+and on restart replays that log through the normal dispatcher to rebuild state.
+Persistence is on by default (`--appendonly`, log at `--aof-path`).
+
+The interesting knob is **when the log reaches the physical disk**. Writing bytes
+with `write()` only hands them to the operating system's page cache; they survive
+a crash of *our process* (`kill -9`) because the kernel still owns them, but a
+**power loss** drops anything the kernel hasn't flushed yet. `fsync()` forces the
+page cache to the disk platter/SSD — and it is slow (~1 ms on an SSD), so *how
+often* we call it is the canonical durability-vs-throughput trade-off. The
+`--appendfsync` flag picks the policy:
+
+| Mode               | When it fsyncs              | Crash can lose     | Speed                       |
+| ------------------ | --------------------------- | ------------------ | --------------------------- |
+| `always`           | after every command         | at most 1 command  | slowest (~1 ms disk/write)  |
+| `everysec` (default) | once a second, in the background | up to ~1 s of writes | fast (write path never waits on disk) |
+| `no`               | never (OS flushes on its own, ~30 s) | up to ~30 s of writes | fastest, riskiest    |
+
+- **`always`** fsyncs inline in the write path, so once a client gets its reply
+  the command is on disk. Safest, but every write pays the sync.
+- **`everysec`** is the sweet spot most deployments want (and Redis's default): a
+  background `time.Ticker` fsyncs once a second while the write path only ever
+  does the cheap `write()`. A crash loses at most the last second.
+- **`no`** never explicitly fsyncs; durability is entirely at the OS's mercy.
+  Fastest, but a power loss can roll you back tens of seconds.
+
+A **clean shutdown is not a crash**: in every mode the log is fsync'd on graceful
+stop, so a normal `Ctrl-C` loses nothing — the mode only governs what an abrupt
+power loss costs.
+
 ## Known gaps / non-goals (for now)
 
 - **Sorted sets** (`ZADD`, `ZRANGE`, …) are intentionally skipped: doing them
   right needs a skip list (or balanced tree) for O(log n) score-ordered ranges,
   which the plain map/slice backings here don't provide.
-- **Persistence / AOF**, **replication**, and **metrics** are scaffolded but not
-  implemented.
+- **Replication** and **metrics** are scaffolded but not implemented. AOF
+  persistence works (see above), but **AOF rewrite/compaction** does not — the
+  log only grows.
 - The store uses **one global lock**; unrelated keys still contend. Sharding is
   future work.
 

@@ -27,7 +27,7 @@ func command(parts ...string) protocol.Value {
 func TestAppendThenReplayRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), persistence.DefaultFilename)
 
-	aof, err := persistence.Open(path)
+	aof, err := persistence.Open(path, persistence.FsyncAlways)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestReplayMissingFileIsNoOp(t *testing.T) {
 func TestReplayToleratesTruncatedTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), persistence.DefaultFilename)
 
-	aof, err := persistence.Open(path)
+	aof, err := persistence.Open(path, persistence.FsyncNo)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -114,5 +114,30 @@ func TestReplayToleratesTruncatedTail(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("Replay applied %d commands; want 2 (torn tail ignored)", n)
+	}
+}
+
+// TestEverySecRoundTrips opens in the everysec mode (which spawns a background
+// fsync goroutine), appends, and closes — Close must stop the goroutine cleanly
+// (no hang) and the data must replay back. Run under -race to catch a fsync
+// racing the close. The 1s ticker never fires in this fast test; Close's own
+// fsync is what makes the data durable, which is the point.
+func TestEverySecRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), persistence.DefaultFilename)
+
+	aof, err := persistence.Open(path, persistence.FsyncEverySec)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := aof.Append(command("SET", "k", "v")); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := aof.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	n, err := persistence.Replay(path, func(protocol.Value) error { return nil })
+	if err != nil || n != 1 {
+		t.Fatalf("Replay = %d, %v; want 1, nil", n, err)
 	}
 }

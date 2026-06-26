@@ -93,13 +93,20 @@ _Last updated: 2026-06-26._
   serialised by the server's `writeMu` so the log's order matches the order the
   store applied them; reads stay lock-free of it. Replay tolerates a truncated
   trailing command (a torn tail from a crash) and a missing file. Failed writes
-  (WRONGTYPE, bad args) are not logged.
+  (WRONGTYPE, bad args) are not logged. Surviving a power loss (not just a
+  process crash) needs an `fsync` to the physical disk; how often that happens is
+  the `FsyncMode` policy (`--appendfsync`): `always` (fsync inline per write,
+  lose ≤1 command), `everysec` (default; a 1s `time.Ticker` goroutine fsyncs in
+  the background, lose ≤1s) or `no` (never; OS flushes on its own). A clean
+  shutdown fsyncs in every mode, so only an abrupt power loss costs writes.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
-  `--appendonly` (default `true`) and `--aof-path` (default `appendonly.aof`).
+  `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`) and
+  `--appendfsync` (default `everysec`).
 - **Tests**: `internal/cmd` unit tests (dispatch, lists, hashes, sets, expiry,
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
   resurrection of expired keys on write), `internal/persistence` unit tests
-  (append/replay round-trip, missing file, truncated-tail tolerance), and
+  (append/replay round-trip, missing file, truncated-tail tolerance, everysec
+  fsync-goroutine lifecycle), and
   `tests/integration/` end-to-end coverage driven by the upstream `go-redis/v9`
   client (`basic_test.go`, `list_test.go`, `hash_test.go`, `set_test.go`,
   `expire_test.go`, and `aof_test.go` — cross-restart durability, failed writes

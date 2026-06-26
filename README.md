@@ -150,6 +150,15 @@ Writes are made durable with an **append-only file (AOF)**: the server logs the
 and on restart replays that log through the normal dispatcher to rebuild state.
 Persistence is on by default (`--appendonly`, log at `--aof-path`).
 
+**Startup replay.** On boot, before accepting any client, the server re-reads the
+log with the *same* RESP decoder used on live connections and re-executes each
+command against the empty store — so recovered state is correct by construction,
+not by a separate loader. No new appends happen during replay (the log is opened
+for writing only *after* recovery finishes), so nothing is duplicated. Recovery
+is fast: replaying **1,000,000 commands takes ~0.71 s (~1.4 million commands/sec)**
+on an Apple M4. The server logs the figure each boot, e.g.
+`aof: recovered 1000000 command(s) from appendonly.aof in 709ms (1410019 cmd/s)`.
+
 The interesting knob is **when the log reaches the physical disk**. Writing bytes
 with `write()` only hands them to the operating system's page cache; they survive
 a crash of *our process* (`kill -9`) because the kernel still owns them, but a

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/cmd"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
@@ -153,17 +154,22 @@ func (s *Server) Serve(ctx context.Context) error {
 // replies with an error is logged and skipped rather than aborting recovery: one
 // unreadable frame should not strand every good write before it.
 func (s *Server) loadAOF() error {
+	start := time.Now()
 	n, err := persistence.Replay(s.aofPath, func(c protocol.Value) error {
 		if reply := cmd.Dispatch(s.db, c); reply.Type == protocol.TypeError {
 			log.Printf("aof replay: %q replied %q (skipped)", commandName(c), reply.Str)
 		}
 		return nil
 	})
+	elapsed := time.Since(start)
 	if err != nil {
 		return fmt.Errorf("aof replay %s: %w", s.aofPath, err)
 	}
 	if n > 0 {
-		log.Printf("aof: recovered %d command(s) from %s", n, s.aofPath)
+		// Report throughput so a slow recovery is visible and measurable: this is
+		// the number quoted in the README.
+		log.Printf("aof: recovered %d command(s) from %s in %s (%.0f cmd/s)",
+			n, s.aofPath, elapsed.Round(time.Millisecond), float64(n)/elapsed.Seconds())
 	}
 
 	aof, err := persistence.Open(s.aofPath, s.fsyncMode)

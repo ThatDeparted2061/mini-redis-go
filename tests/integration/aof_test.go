@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -211,4 +212,106 @@ func sameSet(a, b []string) bool {
 	sort.Strings(as)
 	sort.Strings(bs)
 	return reflect.DeepEqual(as, bs)
+}
+
+// TestAOFRewriteCompactsAndSurvivesRestart exercises compaction end to end: bloat
+// the log past the rewrite threshold, let the background compactor rewrite it
+// down to a snapshot, and confirm the live state is untouched AND that a server
+// restarted from the COMPACTED log alone recovers every key. That last part is
+// what proves the snapshot commands (SET/RPUSH/HSET/SADD/EXPIRE) faithfully
+// reproduce the keyspace.
+func TestAOFRewriteCompactsAndSurvivesRestart(t *testing.T) {
+	aofPath := filepath.Join(t.TempDir(), "appendonly.aof")
+	ctx := opCtx(t)
+
+	c1, stop1 := startAOFServer(t, aofPath)
+
+	// Bloat the log: set the same key thousands of times so the file blows well
+	// past the 64 KiB rewrite floor, even though only the final value matters.
+	const n = 4000
+	if _, err := c1.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i := 0; i < n; i++ {
+			pipe.Set(ctx, "counter", i, 0)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("pipelined SET: %v", err)
+	}
+
+	// A spread of other types and a TTL key, so the snapshot has to recreate each.
+	if err := c1.RPush(ctx, "list", "a", "b", "c").Err(); err != nil {
+		t.Fatalf("RPUSH: %v", err)
+	}
+	if err := c1.HSet(ctx, "hash", "f1", "v1", "f2", "v2").Err(); err != nil {
+		t.Fatalf("HSET: %v", err)
+	}
+	if err := c1.SAdd(ctx, "set", "m1", "m2").Err(); err != nil {
+		t.Fatalf("SADD: %v", err)
+	}
+	if err := c1.Set(ctx, "ttl", "live", 0).Err(); err != nil {
+		t.Fatalf("SET ttl: %v", err)
+	}
+	if err := c1.Expire(ctx, "ttl", time.Hour).Err(); err != nil {
+		t.Fatalf("EXPIRE ttl: %v", err)
+	}
+
+	bloated := fileSize(t, aofPath)
+	if bloated < 64*1024 {
+		t.Fatalf("log is only %d bytes; expected > 64 KiB to arm the rewrite", bloated)
+	}
+
+	// The background compactor checks once a second; wait for it to shrink the log.
+	var compacted int64
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		compacted = fileSize(t, aofPath)
+		if compacted < bloated/2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if compacted >= bloated/2 {
+		t.Fatalf("log was not compacted: still %d bytes (was %d)", compacted, bloated)
+	}
+	if _, err := os.Stat(aofPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("rewrite left a .tmp file behind: %v", err)
+	}
+
+	// The rewrite must not disturb the live keyspace.
+	if got, err := c1.Get(ctx, "counter").Result(); err != nil || got != fmt.Sprint(n-1) {
+		t.Fatalf("after rewrite GET counter = %q, %v; want %q", got, err, fmt.Sprint(n-1))
+	}
+	stop1()
+
+	// Restart from the compacted log alone: every key must replay.
+	c2, stop2 := startAOFServer(t, aofPath)
+	defer stop2()
+
+	if got, err := c2.Get(ctx, "counter").Result(); err != nil || got != fmt.Sprint(n-1) {
+		t.Fatalf("after restart GET counter = %q, %v; want %q", got, err, fmt.Sprint(n-1))
+	}
+	if got, err := c2.LRange(ctx, "list", 0, -1).Result(); err != nil || !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+		t.Fatalf("after restart LRANGE list = %v, %v; want [a b c], nil", got, err)
+	}
+	if got, err := c2.HGetAll(ctx, "hash").Result(); err != nil ||
+		!reflect.DeepEqual(got, map[string]string{"f1": "v1", "f2": "v2"}) {
+		t.Fatalf("after restart HGETALL hash = %v, %v; want {f1:v1 f2:v2}, nil", got, err)
+	}
+	if got, err := c2.SMembers(ctx, "set").Result(); err != nil || !sameSet(got, []string{"m1", "m2"}) {
+		t.Fatalf("after restart SMEMBERS set = %v, %v; want {m1 m2}, nil", got, err)
+	}
+	if d, err := c2.TTL(ctx, "ttl").Result(); err != nil || d <= 0 || d > time.Hour {
+		t.Fatalf("after restart TTL ttl = %v, %v; want a positive TTL <= 1h", d, err)
+	}
+}
+
+// fileSize returns the size of the file at path, failing the test if it can't be
+// stat'd.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Size()
 }

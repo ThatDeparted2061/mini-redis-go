@@ -41,9 +41,18 @@ type Server struct {
 
 	// writeMu serialises the apply-then-append of write commands so the order
 	// commands are recorded in the AOF matches the order the db applied them.
-	// See apply for why that invariant matters.
+	// See apply for why that invariant matters. The AOF compactor also holds it
+	// for the duration of a rewrite, so no write slips into the gap between
+	// snapshotting the keyspace and swapping in the compacted log — see
+	// rewriteAOF.
 	writeMu sync.Mutex
 }
+
+// autoRewriteInterval is how often the background compactor checks whether the
+// append-only log has grown past the rewrite threshold. The check is a single
+// stat, so a modest cadence is plenty — the work only happens when the log has
+// actually doubled.
+const autoRewriteInterval = time.Second
 
 // Option configures a Server at construction time. Options keep New backward
 // compatible: callers that want the default (no persistence) pass none.
@@ -116,6 +125,21 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.db.RunActiveExpiry(ctx)
 	}()
 
+	// When persistence is on, the append-only log grows with every write; this
+	// compactor periodically rewrites it down to a snapshot of the live keyspace
+	// once it has grown enough (see runAutoRewrite). Like the reaper it runs for
+	// the server's lifetime and is waited out on shutdown. rewriteDone stays
+	// closed when persistence is off, so the drain below is a no-op there.
+	rewriteDone := make(chan struct{})
+	if s.aof != nil {
+		go func() {
+			defer close(rewriteDone)
+			s.runAutoRewrite(ctx)
+		}()
+	} else {
+		close(rewriteDone)
+	}
+
 	// wg tracks live connection goroutines so we can wait them out on shutdown
 	// rather than yanking the process out from under in-flight requests.
 	var wg sync.WaitGroup
@@ -142,6 +166,57 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	wg.Wait()
 	<-expiryDone
+	<-rewriteDone
+	return nil
+}
+
+// runAutoRewrite periodically compacts the append-only log, until ctx is
+// cancelled. Each tick it asks the log whether it has grown past the rewrite
+// threshold and, if so, rewrites it. Errors are logged and shrugged off: a
+// failed rewrite leaves the existing log intact, so the only cost is that
+// compaction didn't happen this time.
+func (s *Server) runAutoRewrite(ctx context.Context) {
+	ticker := time.NewTicker(autoRewriteInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.aof.ShouldRewrite() {
+				continue
+			}
+			if err := s.rewriteAOF(); err != nil {
+				log.Printf("aof rewrite failed: %v", err)
+			}
+		}
+	}
+}
+
+// rewriteAOF compacts the append-only log to a snapshot of the current keyspace.
+//
+// It holds writeMu for the whole operation, which is the simple, correct v1
+// design: with the write path frozen, the snapshot can't miss a write that lands
+// mid-rewrite, and no write can append to the old log after we've swapped in the
+// new one. The cost is a latency hit — every client write blocks until the
+// rewrite finishes (a keyspace copy plus a file write and fsync). That is the
+// documented trade-off for v1.
+//
+// ponytail: global write freeze for the whole rewrite. Real Redis forks a child
+// and buffers concurrent writes into the new log so the parent never pauses;
+// that copy-on-write design is the upgrade path when the pause starts to hurt.
+func (s *Server) rewriteAOF() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	before, _ := s.aof.Size()
+	records := s.db.Snapshot()
+	if err := s.aof.Rewrite(s.aofPath, records); err != nil {
+		return err
+	}
+	after, _ := s.aof.Size()
+	log.Printf("aof: rewrote log to %d key(s), %d -> %d bytes", len(records), before, after)
 	return nil
 }
 

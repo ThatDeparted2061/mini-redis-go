@@ -99,6 +99,20 @@ _Last updated: 2026-06-26._
   lose ≤1 command), `everysec` (default; a 1s `time.Ticker` goroutine fsyncs in
   the background, lose ≤1s) or `no` (never; OS flushes on its own). A clean
   shutdown fsyncs in every mode, so only an abrupt power loss costs writes.
+- **Persistence — AOF rewrite / compaction**
+  (`internal/persistence/rewrite.go`, `internal/db/snapshot.go`): the log grows
+  with every write, so a key written a million times leaves a million frames.
+  Compaction replaces that history with a SNAPSHOT — `db.Snapshot` hands out a
+  deep copy of every live key, and the rewriter emits one value-restoring command
+  per key (`SET`/`RPUSH`/`HSET`/`SADD`) plus a `PEXPIRE` for any TTL, writing them
+  to `appendonly.aof.tmp` and `os.Rename`-ing it over the live log (atomic on
+  POSIX). A background goroutine in the server checks once a second and triggers a
+  rewrite once the log is past a 64 KiB floor AND has doubled since the last
+  rewrite (`AOF.ShouldRewrite`, mirroring Redis's `auto-aof-rewrite-percentage`).
+  The rewrite holds the server's `writeMu` for its whole duration — the simple v1
+  design: writes pause so no command slips into the gap between snapshot and
+  swap, at the cost of a write-latency hit (Redis avoids it with a fork/COW child;
+  that's the upgrade path).
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
   `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`) and
   `--appendfsync` (default `everysec`).
@@ -106,18 +120,17 @@ _Last updated: 2026-06-26._
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
   resurrection of expired keys on write), `internal/persistence` unit tests
   (append/replay round-trip, missing file, truncated-tail tolerance, everysec
-  fsync-goroutine lifecycle), and
+  fsync-goroutine lifecycle, and rewrite compaction + the `ShouldRewrite`
+  trigger), and
   `tests/integration/` end-to-end coverage driven by the upstream `go-redis/v9`
   client (`basic_test.go`, `list_test.go`, `hash_test.go`, `set_test.go`,
   `expire_test.go`, and `aof_test.go` — cross-restart durability, failed writes
-  not persisted, and concurrent-write replay ordering).
+  not persisted, concurrent-write replay ordering, and rewrite-then-restart
+  recovery).
 
 ### Scaffolded (not yet implemented — empty stub files)
 - Commands: pub/sub, replication (`internal/cmd/{pubsub,replication}.go`).
 - Store internals: `pubsub`, `shard` (`internal/db/`).
-- AOF rewrite / compaction: `internal/persistence/rewrite.go`. The log only
-  grows today (every write is appended forever); rewrite will compact it to the
-  minimal command set that reproduces the current state.
 - Replication: `internal/replication/{primary,replica}.go`.
 - Metrics: `internal/metrics/metrics.go`.
 - Tests: `tests/integration/replication_test.go`, `tests/chaos/*`.

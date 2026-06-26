@@ -95,11 +95,31 @@ type AOF struct {
 	w    *bufio.Writer
 	mode FsyncMode
 
+	// baseSize is the log's size on disk right after the last rewrite (or, until
+	// the first rewrite, its size when Open'd). The rewrite trigger compares the
+	// current size against it to decide the log has grown enough to compact — see
+	// ShouldRewrite. Guarded by mu.
+	baseSize int64
+
 	// stop/done drive the everysec ticker goroutine: Close closes stop to ask it
 	// to exit and waits on done. Both are nil in the other modes (no goroutine).
 	stop chan struct{}
 	done chan struct{}
 }
+
+// Auto-rewrite thresholds, mirroring Redis's auto-aof-rewrite-* knobs.
+const (
+	// rewriteGrowthFactor triggers compaction once the log reaches this multiple
+	// of its post-rewrite baseline — 2x, i.e. Redis's default
+	// auto-aof-rewrite-percentage of 100 ("the log has doubled").
+	rewriteGrowthFactor = 2
+
+	// minRewriteSize is the smallest log worth compacting. Below it the savings
+	// don't justify the rewrite, and it stops a tiny log (whose baseline is near
+	// zero, so any growth is "2x") from rewriting on every check. Redis defaults
+	// to 64MB; this is far smaller because mini-redis keyspaces are.
+	minRewriteSize = 64 * 1024 // 64 KiB
+)
 
 // Open opens the AOF at path for appending, creating it if it does not exist.
 //
@@ -114,6 +134,12 @@ func Open(path string, mode FsyncMode) (*AOF, error) {
 		return nil, err
 	}
 	a := &AOF{f: f, w: bufio.NewWriter(f), mode: mode}
+	// Seed the rewrite baseline with the size of the log we're continuing, so a
+	// freshly-started server measures growth from what it recovered, not from
+	// zero.
+	if info, statErr := f.Stat(); statErr == nil {
+		a.baseSize = info.Size()
+	}
 	if mode == FsyncEverySec {
 		a.stop = make(chan struct{})
 		a.done = make(chan struct{})
@@ -175,6 +201,40 @@ func (a *AOF) Flush() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.w.Flush()
+}
+
+// Size reports the log's current size on disk in bytes. Append flushes every
+// call, so the stat reflects every command written so far.
+func (a *AOF) Size() (int64, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sizeLocked()
+}
+
+// sizeLocked is Size without taking the lock, for callers that already hold a.mu.
+func (a *AOF) sizeLocked() (int64, error) {
+	info, err := a.f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// ShouldRewrite reports whether the log has grown enough to warrant compaction:
+// it must be at least minRewriteSize on disk AND at least rewriteGrowthFactor
+// times its size after the last rewrite. The size floor keeps a small log from
+// rewriting constantly (its baseline is near zero, so the growth test alone
+// would always pass). A stat error is reported as "no" — a failing rewrite check
+// must never be louder than the failing write that would surface the real
+// problem.
+func (a *AOF) ShouldRewrite() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	size, err := a.sizeLocked()
+	if err != nil {
+		return false
+	}
+	return size >= minRewriteSize && size >= rewriteGrowthFactor*a.baseSize
 }
 
 // Close stops the everysec ticker (if any), flushes any buffered bytes, fsyncs,

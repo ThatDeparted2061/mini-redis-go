@@ -155,9 +155,11 @@ log with the *same* RESP decoder used on live connections and re-executes each
 command against the empty store — so recovered state is correct by construction,
 not by a separate loader. No new appends happen during replay (the log is opened
 for writing only *after* recovery finishes), so nothing is duplicated. Recovery
-is fast: replaying **1,000,000 commands takes ~0.71 s (~1.4 million commands/sec)**
-on an Apple M4. The server logs the figure each boot, e.g.
-`aof: recovered 1000000 command(s) from appendonly.aof in 709ms (1410019 cmd/s)`.
+is fast: replaying **1,000,000 distinct-key writes takes ~0.95 s (~1.0 million
+commands/sec)** on an Apple M4, decode + dispatch into a fresh store. The server
+logs the figure each boot, e.g. `aof: recovered 1000000 command(s) from
+appendonly.aof in 991ms (1008654 cmd/s)`. Reproduce with
+`go test ./internal/persistence/ -run='^$' -bench=BenchmarkReplay`.
 
 The interesting knob is **when the log reaches the physical disk**. Writing bytes
 with `write()` only hands them to the operating system's page cache; they survive

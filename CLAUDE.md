@@ -16,6 +16,16 @@ assume I don't know anything and explain it from the ground up:
 - Use plain language, concrete analogies, and step-by-step examples.
 - Favor "what this means and why" over a line-by-line restatement of the code.
 
+**Always give the explanation in this order:**
+
+1. **Plain-terms first** — explain the idea with everyday language and a concrete
+   analogy, as if to someone who has never seen the code.
+2. **Then the technical terms, mapped to the analogy** — name the real terms
+   (the function, the data structure, the protocol) and tie each one back to the
+   plain-terms version, so the analogy and the actual code line up.
+3. **Then a flowchart** — an ASCII diagram of what is happening (the flow of
+   data/control), so the moving parts are visible at a glance.
+
 This applies to every explanation request unless I explicitly ask for the short
 or expert version.
 
@@ -79,10 +89,27 @@ _Last updated: 2026-06-26._
     active (a background reaper, `db.RunActiveExpiry`, wakes every 100ms, samples
     20 TTL-bearing keys, deletes the expired ones, and re-samples while >25% are
     expired).
+  - Pub/Sub (`internal/cmd/pubsub.go` for `PUBLISH`; `internal/db/pubsub.go` for
+    the bus): `PUBLISH` is a normal handler; `SUBSCRIBE`/`UNSUBSCRIBE` are
+    intercepted in the connection loop (`internal/server/{connection,pubsub}.go`)
+    because they act on the connection, not the keyspace.
+- **Pub/Sub message bus** (`internal/db/pubsub.go`): a `Broker`
+  (`map[channel] -> []*Subscriber`) reachable via `db.PubSub()`, independent of
+  the keyspace. Each subscribed connection owns a buffered mailbox (`chan Message`,
+  cap 256) and a delivery goroutine that drains it to the socket; the
+  connection's `writeMu` serialises pushed messages against ordinary replies so
+  RESP frames never interleave. `PUBLISH` fans out with a NON-BLOCKING send and
+  DROPS to a slow subscriber (full mailbox) with a logged warning rather than
+  blocking the publisher — the v1 trade-off (real Redis disconnects). Subscribed
+  connections enter a restricted mode (only `SUBSCRIBE`/`UNSUBSCRIBE`/`PING`/
+  `QUIT`). Teardown unregisters from the broker before closing the mailbox, so a
+  concurrent `PUBLISH` can never send on a closed channel.
 - **Server** (`internal/server`): TCP accept loop, one goroutine per
   connection, graceful shutdown on SIGINT/SIGTERM (context-cancel closes the
   listener and drains in-flight connections). Launches the active-expiry reaper
-  for the server's lifetime and waits for it on shutdown.
+  and (when persistence is on) the AOF compactor for the server's lifetime and
+  waits for them on shutdown. The per-connection loop routes pub/sub control
+  commands and enforces subscribe-mode restrictions; `QUIT` is handled here too.
 - **Persistence — append-only file** (`internal/persistence/{aof,replay}.go`):
   durability by logging the COMMAND, not the resulting state. On startup the
   server replays the log (`persistence.Replay`) by re-dispatching each recorded
@@ -126,11 +153,13 @@ _Last updated: 2026-06-26._
   client (`basic_test.go`, `list_test.go`, `hash_test.go`, `set_test.go`,
   `expire_test.go`, and `aof_test.go` — cross-restart durability, failed writes
   not persisted, concurrent-write replay ordering, and rewrite-then-restart
-  recovery).
+  recovery), plus `internal/db` broker tests (fan-out, payload copy, slow-
+  subscriber drop, unsubscribe cleanup) and `tests/integration/pubsub_test.go`
+  (cross-connection delivery, fan-out, publish-to-nobody).
 
 ### Scaffolded (not yet implemented — empty stub files)
-- Commands: pub/sub, replication (`internal/cmd/{pubsub,replication}.go`).
-- Store internals: `pubsub`, `shard` (`internal/db/`).
+- Commands: replication (`internal/cmd/replication.go`).
+- Store internals: `shard` (`internal/db/`).
 - Replication: `internal/replication/{primary,replica}.go`.
 - Metrics: `internal/metrics/metrics.go`.
 - Tests: `tests/integration/replication_test.go`, `tests/chaos/*`.
@@ -151,8 +180,10 @@ _Last updated: 2026-06-26._
 Request flow for one client command:
 
 ```
-TCP conn → protocol.Decode → server.apply ┬→ cmd.Dispatch → handler(db, args) ┐
-                                           └→ (write & ok) AOF append           │
+TCP conn → protocol.Decode → server.serve ┬→ SUBSCRIBE/UNSUBSCRIBE (connection-level) ┐
+                                           ├→ server.apply ┬→ cmd.Dispatch → handler   │
+                                           │               └→ (write & ok) AOF append   │
+                                           └→ QUIT / subscribe-mode guard               │
                                                           protocol.Encode → TCP conn
 ```
 
@@ -162,6 +193,14 @@ for the whole process — all keyspace concurrency safety lives inside its
 `RWMutex`. The server adds one lock of its own, `writeMu`, held only on the
 write path so a command's database mutation and its AOF append happen as a unit
 and the log's order matches the store's; reads never take it.
+
+Pub/Sub is the exception to "handlers never touch the socket": `SUBSCRIBE`/
+`UNSUBSCRIBE` act on the connection (register a mailbox, enter/leave subscribe
+mode, spawn a delivery goroutine), so `server.serve` handles them directly
+instead of routing through `cmd.Dispatch`. `PUBLISH` stays an ordinary handler —
+it only needs the broker, reachable via `db.PubSub()`. Each connection has a
+`writeMu` (separate from the server-wide AOF `writeMu`) serialising socket writes
+so a pushed message can't interleave with a reply.
 
 ## Build / test / run
 

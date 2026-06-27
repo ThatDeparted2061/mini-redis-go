@@ -28,6 +28,7 @@ go test -race ./...                 # run with the race detector
 | Hash     | `HSET` `HGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN`           |
 | Set      | `SADD` `SREM` `SISMEMBER` `SMEMBERS` `SCARD`                    |
 | Expiry   | `EXPIRE` `PEXPIRE` `TTL` `PTTL` `PERSIST`                       |
+| Pub/Sub  | `SUBSCRIBE` `UNSUBSCRIBE` `PUBLISH`                             |
 
 A key holds exactly one type; using a command on the wrong type returns the
 canonical `WRONGTYPE` error, just like Redis.
@@ -187,14 +188,49 @@ A **clean shutdown is not a crash**: in every mode the log is fsync'd on gracefu
 stop, so a normal `Ctrl-C` loses nothing — the mode only governs what an abrupt
 power loss costs.
 
+## Pub/Sub and the slow-subscriber problem
+
+`SUBSCRIBE`/`PUBLISH` are a message bus, not storage: a published message is
+fanned out to whoever is listening *right now* and is never saved. The broker is
+a `map[channel] -> []subscriber`; each subscribed connection owns a buffered Go
+channel (its "mailbox", cap 256) and a goroutine that drains the mailbox to the
+socket. `PUBLISH` drops the message into every subscriber's mailbox.
+
+A subscribed connection enters a **restricted mode** — only
+`SUBSCRIBE`/`UNSUBSCRIBE`/`PING`/`QUIT` are accepted — because the connection has
+become a one-way stream of pushed messages.
+
+**The slow-subscriber problem** is the interesting part. A publisher can produce
+faster than a subscriber consumes (a slow client, a saturated network). Messages
+pile up in that subscriber's mailbox. Something has to give, and there are only
+three options:
+
+1. **Block the publisher** until the slow subscriber catches up. Fatal: `PUBLISH`
+   runs on the *publisher's* goroutine, so one slow consumer would freeze the
+   client that published — and every other subscriber waiting behind it. One slow
+   reader must never be able to stall the whole bus.
+2. **Drop the message** for the slow subscriber and move on. The publisher stays
+   fast; the slow subscriber simply misses messages. Memory stays bounded.
+3. **Disconnect the slow subscriber.** What real Redis does once a subscriber
+   overruns its output-buffer limit — bounded memory, and the client gets a clear
+   signal (a dropped connection) rather than silent gaps.
+
+This server takes option **2** for v1: the send is non-blocking
+(`select { case mailbox <- msg: default: /* drop + log */ }`), so a full mailbox
+means the message is dropped with a logged warning, never a stall. It's the
+simplest choice that keeps the publisher fast and memory bounded; option 3 is the
+upgrade path. The trade-off — silent message loss under back-pressure vs. a
+disconnect — is the heart of any pub/sub system's delivery guarantees (and a
+great interview talking point).
+
 ## Known gaps / non-goals (for now)
 
 - **Sorted sets** (`ZADD`, `ZRANGE`, …) are intentionally skipped: doing them
   right needs a skip list (or balanced tree) for O(log n) score-ordered ranges,
   which the plain map/slice backings here don't provide.
-- **Replication** and **metrics** are scaffolded but not implemented. AOF
-  persistence works (see above), but **AOF rewrite/compaction** does not — the
-  log only grows.
+- **Replication** and **metrics** are scaffolded but not implemented.
+- Pub/Sub has no pattern matching (`PSUBSCRIBE`/`PUBLISH` glob channels) and
+  drops, rather than disconnects, slow subscribers (see above).
 - The store uses **one global lock**; unrelated keys still contend. Sharding is
   future work.
 

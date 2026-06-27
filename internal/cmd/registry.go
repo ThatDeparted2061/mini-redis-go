@@ -65,6 +65,7 @@ var commands = map[string]CmdFunc{
 	"TTL":       TTL,
 	"PTTL":      PTTL,
 	"PERSIST":   Persist,
+	"PUBLISH":   Publish,
 }
 
 // writeCommands names every command that MUTATES the keyspace, and so must be

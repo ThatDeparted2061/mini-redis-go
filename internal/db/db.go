@@ -37,13 +37,22 @@ type DB struct {
 
 	// data is the whole keyspace. One map, one lock — see the package comment.
 	data map[string]*Entry
+
+	// pubsub is the process-wide message bus (PUBLISH/SUBSCRIBE). It is
+	// independent of the keyspace above — see pubsub.go — and reached via PubSub().
+	pubsub *Broker
 }
 
 // New returns an empty, ready-to-use DB. The map is allocated up front so that
 // the zero-length store still accepts writes without a nil-map panic.
 func New() *DB {
-	return &DB{data: make(map[string]*Entry)}
+	return &DB{data: make(map[string]*Entry), pubsub: NewBroker()}
 }
+
+// PubSub returns the database's pub/sub broker — the message bus that PUBLISH and
+// SUBSCRIBE run against. It is exposed here so a command handler (which is only
+// handed the DB) can reach the broker without a separate plumbing path.
+func (db *DB) PubSub() *Broker { return db.pubsub }
 
 // cloneBytes returns an independent copy of b so the store owns its data outright
 // rather than aliasing a caller's buffer (ultimately the decoder's read buffer),

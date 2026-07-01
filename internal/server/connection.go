@@ -90,7 +90,7 @@ func (cs *connState) writeRaw(frame []byte) error {
 // boundary), sends QUIT, or an unrecoverable IO/protocol error occurs. On return
 // the connection is closed and any pub/sub subscriptions are torn down.
 func (s *Server) handle(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	remote := conn.RemoteAddr()
 	log.Printf("connection opened: %s", remote)

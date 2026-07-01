@@ -146,7 +146,7 @@ func TestShouldRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer aof.Close()
+	defer func() { _ = aof.Close() }()
 
 	// A tiny log is below the size floor, so no rewrite however much it "grew"
 	// relative to its near-zero baseline.

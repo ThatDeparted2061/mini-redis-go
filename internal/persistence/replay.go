@@ -38,7 +38,7 @@ func Replay(path string, apply func(cmd protocol.Value) error) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	r := bufio.NewReader(f)
 	applied := 0

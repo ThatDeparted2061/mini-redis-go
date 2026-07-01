@@ -54,22 +54,22 @@ func (a *AOF) Rewrite(path string, records []db.SnapshotEntry) error {
 	}
 	w := bufio.NewWriter(f)
 	if err := writeSnapshot(w, records); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := w.Flush(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 
@@ -77,7 +77,7 @@ func (a *AOF) Rewrite(path string, records []db.SnapshotEntry) error {
 	//    inode is unlinked; our existing a.f still points at it, so it must not be
 	//    used for further writes.
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 
@@ -90,8 +90,8 @@ func (a *AOF) Rewrite(path string, records []db.SnapshotEntry) error {
 	if err != nil {
 		return fmt.Errorf("reopen after rewrite: %w", err)
 	}
-	a.w.Flush() // normally nothing buffered (Append flushes), but be safe
-	a.f.Close()
+	_ = a.w.Flush() // normally nothing buffered (Append flushes), but be safe
+	_ = a.f.Close()
 	a.f = nf
 	a.w = bufio.NewWriter(nf)
 

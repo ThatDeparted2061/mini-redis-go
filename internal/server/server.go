@@ -130,7 +130,11 @@ func (s *Server) Serve(ctx context.Context) error {
 		if err := s.loadAOF(); err != nil {
 			return err
 		}
-		defer s.aof.Close()
+		defer func() {
+			if err := s.aof.Close(); err != nil {
+				log.Printf("aof: close on shutdown: %v", err)
+			}
+		}()
 	}
 
 	// When the context is cancelled (e.g. on SIGINT) close the listener. That
@@ -139,7 +143,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		log.Println("shutting down, closing listener")
-		s.ln.Close()
+		_ = s.ln.Close()
 	}()
 
 	// Active expiry runs for the server's lifetime, reclaiming keys whose TTL

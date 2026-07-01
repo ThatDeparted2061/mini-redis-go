@@ -14,7 +14,7 @@ func TestPubSubDeliversAcrossConnections(t *testing.T) {
 	ctx := opCtx(t)
 
 	sub := client.Subscribe(ctx, "news")
-	defer sub.Close()
+	defer func() { _ = sub.Close() }()
 
 	// Block for the subscribe confirmation so the subscription is registered
 	// before we publish — otherwise the publish could race ahead of it.
@@ -43,7 +43,7 @@ func TestPubSubFanout(t *testing.T) {
 
 	subs := []*redis.PubSub{client.Subscribe(ctx, "room"), client.Subscribe(ctx, "room")}
 	for _, sub := range subs {
-		defer sub.Close()
+		defer func() { _ = sub.Close() }()
 		if _, err := sub.Receive(ctx); err != nil {
 			t.Fatalf("subscribe confirmation: %v", err)
 		}

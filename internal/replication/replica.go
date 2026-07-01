@@ -55,13 +55,13 @@ func streamOnce(ctx context.Context, primaryAddr string, apply func(protocol.Val
 	if err != nil {
 		return fmt.Errorf("dial primary %s: %w", primaryAddr, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Close the socket on shutdown so the blocking Decode below unblocks and this
 	// goroutine can return — the same trick the accept loop uses on its listener.
 	go func() {
 		<-ctx.Done()
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	r := bufio.NewReader(conn)

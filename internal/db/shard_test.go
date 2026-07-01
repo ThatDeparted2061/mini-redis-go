@@ -11,8 +11,11 @@ import (
 // parallelism). A bug that collapsed every key onto one shard would still pass
 // every functional test — but it fails here.
 func TestShardIndexStableAndSpread(t *testing.T) {
-	// Deterministic: same key, same shard, every call.
-	if shardIndex("hello") != shardIndex("hello") {
+	// Deterministic: same key, same shard, every call. Compute once, then
+	// re-compute and compare — a plain f(x) != f(x) is a smell a compiler could
+	// fold, and it wouldn't catch a shardIndex that varied between calls.
+	first := shardIndex("hello")
+	if shardIndex("hello") != first {
 		t.Fatal("shardIndex is not deterministic")
 	}
 

@@ -66,12 +66,19 @@ _Last updated: 2026-07-01._
 ### Implemented
 - **RESP2 protocol** (`internal/protocol`): decoder, encoder, value model, with
   parser tests. Binary-safe bulk strings.
-- **Typed in-memory store** (`internal/db/`): `DB` guarded by an `RWMutex`,
-  keyed to `*Entry` values (`entry.go`) that carry a type tag (string, list,
-  hash, or set) plus an `expireAt` deadline. Operations are type-checked and
-  return `ErrWrongType` on a mismatch. All key lookups funnel through two
-  expiry-aware helpers — `peek` (read side) and `liveEntry` (write side) — so
-  expired keys are uniformly invisible.
+- **Sharded typed in-memory store** (`internal/db/`): the keyspace is split
+  across 32 shards (`shard.go`), each a map under its own `RWMutex`; a key is
+  routed to its shard by `FNV-1a(key) % 32` (`shardFor`/`shardIndex`, via
+  stdlib `hash/fnv`), so operations on keys in different shards take different
+  locks and run in parallel (Day 18 — replaces the former single map + one
+  global `RWMutex`). Keys map to `*Entry` values (`entry.go`) that carry a type
+  tag (string, list, hash, or set) plus an `expireAt` deadline. Operations are
+  type-checked and return `ErrWrongType` on a mismatch. All key lookups funnel
+  through two expiry-aware, per-shard helpers — `peek` (read side) and
+  `liveEntry` (write side) — so expired keys are uniformly invisible. Multi-key
+  commands (`DEL`/`EXISTS`) lock each key's shard one at a time; whole-keyspace
+  passes (`Snapshot`, active expiry) walk every shard, locking one at a time,
+  with active expiry sampling from a random shard so none is starved.
 - **Command dispatch** (`internal/cmd/registry.go`): case-insensitive name
   lookup → handler → RESP reply. Registered commands:
   - Generic/string: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`
@@ -207,10 +214,11 @@ _Last updated: 2026-07-01._
   restarted replica starts empty and only takes new writes — the Day-17 no-initial-
   sync contract) and `internal/replication` white-box tests (`Propagate` enqueues
   per replica, drops without blocking on a full queue, `Remove` closes the feed
-  safely, and `StaleReplicas` flags a replica that stops acking heartbeats).
+  safely, and `StaleReplicas` flags a replica that stops acking heartbeats), plus
+`internal/db` shard tests (`shard_test.go` — `shardIndex` is deterministic and
+spreads distinct keys across most shards).
 
 ### Scaffolded (not yet implemented — empty stub files)
-- Store internals: `shard` (`internal/db/`).
 - Metrics: `internal/metrics/metrics.go`.
 - Tests: `tests/chaos/*`.
 - Note: `internal/cmd/replication.go` is a vestigial stub — `REPLICAOF` is handled
@@ -243,10 +251,17 @@ TCP conn → protocol.Decode → server.serve ┬→ SUBSCRIBE/UNSUBSCRIBE/REPLI
 
 Handlers never touch the socket or RESP wire format; they receive decoded
 arguments and return a `protocol.Value`. There is exactly one shared `db.DB`
-for the whole process — all keyspace concurrency safety lives inside its
-`RWMutex`. The server adds one lock of its own, `writeMu`, held only on the
-write path so a command's database mutation and its AOF append happen as a unit
-and the log's order matches the store's; reads never take it.
+for the whole process — all keyspace concurrency safety lives inside its shards,
+each with its own `RWMutex`, so unrelated keys never contend (see the store
+entry above). The server adds one lock of its own, `writeMu`, held only on the
+write path AND only when the AOF or a replica is attached, so a command's
+database mutation, its AOF append, and its replica propagation happen as a unit
+and the single log's order matches the store's; reads never take it, and neither
+do writes when persistence and replication are both off (leaving those writes to
+parallelise freely across shards). Keeping `writeMu` is why the sharded store
+needs no separate single-writer AOF channel: it already serialises the one
+ordered log. Making AOF-on writes parallelise too (a per-write enqueue under the
+shard lock feeding one log-writer goroutine) is the documented upgrade path.
 
 Pub/Sub is the exception to "handlers never touch the socket": `SUBSCRIBE`/
 `UNSUBSCRIBE` act on the connection (register a mailbox, enter/leave subscribe

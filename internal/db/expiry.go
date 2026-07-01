@@ -21,6 +21,7 @@ package db
 
 import (
 	"context"
+	"math/rand"
 	"time"
 )
 
@@ -37,11 +38,12 @@ func (e *Entry) expired(t time.Time) bool {
 // may have been refreshed (EXPIRE/PERSIST) or replaced (SET). Callers must hold
 // no lock.
 func (db *DB) expireIfNeeded(key string) bool {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	if e, ok := db.data[key]; ok && e.expired(time.Now()) {
-		delete(db.data, key)
+	if e, ok := sh.data[key]; ok && e.expired(time.Now()) {
+		delete(sh.data, key)
 		return true
 	}
 	return false
@@ -52,15 +54,16 @@ func (db *DB) expireIfNeeded(key string) bool {
 // key immediately and still reports true, matching Redis EXPIRE with a past
 // deadline. An already-expired key is treated as absent. Write lock.
 func (db *DB) Expire(key string, d time.Duration) bool {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, ok := db.liveEntry(key)
+	e, ok := sh.liveEntry(key)
 	if !ok {
 		return false
 	}
 	if d <= 0 {
-		delete(db.data, key)
+		delete(sh.data, key)
 		return true
 	}
 	e.expireAt = time.Now().Add(d)
@@ -71,10 +74,11 @@ func (db *DB) Expire(key string, d time.Duration) bool {
 // actually cleared: false if the key is absent/expired or already had none.
 // Write lock.
 func (db *DB) Persist(key string) bool {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, ok := db.liveEntry(key)
+	e, ok := sh.liveEntry(key)
 	if !ok || e.expireAt.IsZero() {
 		return false
 	}
@@ -88,10 +92,11 @@ func (db *DB) Persist(key string) bool {
 // persistent (reported as -1). When both are true, remaining is the time left.
 // Read lock.
 func (db *DB) TTL(key string) (remaining time.Duration, exists, hasTTL bool) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return 0, false, false
 	}
@@ -149,31 +154,38 @@ func (db *DB) RunActiveExpiry(ctx context.Context) {
 // deletes the expired ones, and reports whether the sample was "hot" — more than
 // activeExpiryThreshold expired — so the caller knows to run another pass.
 //
-// The sample is drawn simply by ranging the map: Go randomises map iteration
-// order, so each pass inspects a different, effectively random slice of the
-// keyspace without us maintaining any extra index. Only keys WITH a TTL are
-// sampled — they are the meaningful denominator for the 25% ratio — so persistent
-// keys are skipped, mirroring how Redis samples from its separate "expires" dict.
-// Write lock.
+// With the keyspace sharded, the sample is spread ACROSS shards — the sharded
+// analog of Redis's "20 random keys per pass". The walk starts at a RANDOM shard
+// so that when the sample budget runs out before every shard is visited, it is
+// not always the same low-numbered shards that get reaped (which would let
+// set-and-forgotten expired keys in high shards leak indefinitely). Within a
+// shard the sample is drawn by ranging its map, whose iteration order Go
+// randomises for free. Only keys WITH a TTL are sampled — the meaningful
+// denominator for the 25% ratio — so persistent keys are skipped, mirroring how
+// Redis samples from its separate "expires" dict. Each shard is locked one at a
+// time (never all at once) for the duration it is being sampled.
 func (db *DB) activeExpiryPass() bool {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	now := time.Now()
 	sampled, expired := 0, 0
-	for key, e := range db.data {
-		if e.expireAt.IsZero() {
-			continue // persistent key: not a candidate
-		}
 
-		sampled++
-		if e.expired(now) {
-			delete(db.data, key) // safe to delete the current key while ranging
-			expired++
+	start := rand.Intn(shardCount)
+	for i := 0; i < shardCount && sampled < activeExpirySample; i++ {
+		sh := &db.shards[(start+i)%shardCount]
+		sh.mu.Lock()
+		for key, e := range sh.data {
+			if e.expireAt.IsZero() {
+				continue // persistent key: not a candidate
+			}
+			sampled++
+			if e.expired(now) {
+				delete(sh.data, key) // safe to delete the current key while ranging
+				expired++
+			}
+			if sampled >= activeExpirySample {
+				break
+			}
 		}
-		if sampled >= activeExpirySample {
-			break
-		}
+		sh.mu.Unlock()
 	}
 
 	return sampled > 0 && float64(expired)/float64(sampled) > activeExpiryThreshold

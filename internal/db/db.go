@@ -1,19 +1,19 @@
 // Package db is the in-memory key/value store at the heart of the server.
 //
-// Phase 1 deliberately uses a SINGLE sync.RWMutex guarding ONE map for the
-// entire keyspace. That is the simplest thing that is correct, but it is also a
-// scalability bottleneck: every write serialises against every other read and
-// write, no matter which key is involved. Two clients touching two completely
-// unrelated keys still contend on the same lock.
+// The keyspace is SHARDED: instead of one map under one global RWMutex, it is
+// split across shardCount independent maps, each with its own lock (see
+// shard.go). A key is routed to a shard by hashing its name, so operations on
+// keys that hash to different shards take different locks and run in parallel —
+// two clients touching two unrelated keys no longer queue behind one global
+// lock. Every keyed method here follows the same shape: resolve the key's shard
+// with db.shardFor(key), then lock THAT shard (RLock to read, Lock to write).
 //
-// Phase 6 will replace this with a sharded design (many maps, each with its own
-// lock) so unrelated keys can be mutated in parallel. Until then we keep the
-// implementation intentionally simple and slow.
+// Whole-keyspace operations (Snapshot, active expiry) are the exception: they
+// visit every shard, locking one at a time — see snapshot.go and expiry.go.
 package db
 
 import (
 	"errors"
-	"sync"
 	"time"
 )
 
@@ -31,22 +31,23 @@ var ErrWrongType = errors.New("wrong kind of value")
 // or arbitrary encodings, and the RESP bulk-string type that carries them is
 // already a []byte.
 type DB struct {
-	// mu guards data. Callers must never touch data without holding mu in the
-	// appropriate mode: RLock for reads, Lock for writes.
-	mu sync.RWMutex
-
-	// data is the whole keyspace. One map, one lock — see the package comment.
-	data map[string]*Entry
+	// shards is the keyspace, split into shardCount independent maps each under
+	// its own lock (see shard.go). shardFor(key) picks the one a key belongs to.
+	shards [shardCount]shard
 
 	// pubsub is the process-wide message bus (PUBLISH/SUBSCRIBE). It is
 	// independent of the keyspace above — see pubsub.go — and reached via PubSub().
 	pubsub *Broker
 }
 
-// New returns an empty, ready-to-use DB. The map is allocated up front so that
-// the zero-length store still accepts writes without a nil-map panic.
+// New returns an empty, ready-to-use DB. Each shard's map is allocated up front
+// so the zero-length store still accepts writes without a nil-map panic.
 func New() *DB {
-	return &DB{data: make(map[string]*Entry), pubsub: NewBroker()}
+	db := &DB{pubsub: NewBroker()}
+	for i := range db.shards {
+		db.shards[i].data = make(map[string]*Entry)
+	}
+	return db
 }
 
 // PubSub returns the database's pub/sub broker — the message bus that PUBLISH and
@@ -63,36 +64,6 @@ func cloneBytes(b []byte) []byte {
 	return c
 }
 
-// peek returns the entry stored at key if it exists and has not expired,
-// reporting an expired key as absent WITHOUT deleting it. Callers must already
-// hold the read lock, so it cannot reclaim the expired key itself; that is left
-// to GET's lazy path, the write helpers, and the active reaper (see expiry.go).
-// Every read command funnels its lookup through here so expiry is honoured
-// uniformly across types.
-func (db *DB) peek(key string) (*Entry, bool) {
-	e, ok := db.data[key]
-	if !ok || e.expired(time.Now()) {
-		return nil, false
-	}
-	return e, true
-}
-
-// liveEntry returns the entry stored at key if it exists and has not expired,
-// lazily DELETING it if it has. Callers must hold the write lock. Every write
-// command funnels its lookup through here, which is also what makes a write to
-// an expired key resurrect it as a fresh value instead of mutating stale data.
-func (db *DB) liveEntry(key string) (*Entry, bool) {
-	e, ok := db.data[key]
-	if !ok {
-		return nil, false
-	}
-	if e.expired(time.Now()) {
-		delete(db.data, key)
-		return nil, false
-	}
-	return e, true
-}
-
 // ---------------------------------------------------------------------------
 // String type
 // ---------------------------------------------------------------------------
@@ -107,25 +78,26 @@ func (db *DB) liveEntry(key string) (*Entry, bool) {
 // expired key pays a brief escalation to the write lock (via expireIfNeeded) to
 // evict it. The returned slice aliases the stored value, so treat it as read-only.
 func (db *DB) Get(key string) ([]byte, bool, error) {
-	db.mu.RLock()
-	e, ok := db.data[key]
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	e, ok := sh.data[key]
 	if !ok {
-		db.mu.RUnlock()
+		sh.mu.RUnlock()
 		return nil, false, nil
 	}
 	// An expired key is invisible regardless of its type, so check expiry before
 	// the type check: GET on an expired list key is a miss, not a WRONGTYPE.
 	if e.expired(time.Now()) {
-		db.mu.RUnlock()
+		sh.mu.RUnlock()
 		db.expireIfNeeded(key)
 		return nil, false, nil
 	}
 	if e.kind != kindString {
-		db.mu.RUnlock()
+		sh.mu.RUnlock()
 		return nil, false, ErrWrongType
 	}
 	value := e.str
-	db.mu.RUnlock()
+	sh.mu.RUnlock()
 	return value, true, nil
 }
 
@@ -138,10 +110,11 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 func (db *DB) Set(key string, value []byte) {
 	stored := cloneBytes(value)
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	db.data[key] = &Entry{kind: kindString, str: stored}
+	sh.data[key] = &Entry{kind: kindString, str: stored}
 }
 
 // ---------------------------------------------------------------------------
@@ -151,35 +124,40 @@ func (db *DB) Set(key string, value []byte) {
 // Del removes each of the given keys that is present and returns how many keys
 // were actually deleted, regardless of their type. Keys that do not exist are
 // skipped and do not count (so deleting the same key twice in one call counts
-// once, matching Redis DEL). Write lock.
+// once, matching Redis DEL).
+//
+// Each key is locked in its own shard as it is processed rather than under one
+// global lock, so DEL of keys in different shards is not one atomic step — but
+// each key's delete is independent and the returned count is exact, which is all
+// DEL promises.
 func (db *DB) Del(keys ...string) int {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	removed := 0
 	for _, key := range keys {
+		sh := db.shardFor(key)
+		sh.mu.Lock()
 		// liveEntry drops an already-expired key and reports it absent, so DEL
 		// neither counts nor double-frees a key the TTL has already retired.
-		if _, ok := db.liveEntry(key); ok {
-			delete(db.data, key)
+		if _, ok := sh.liveEntry(key); ok {
+			delete(sh.data, key)
 			removed++
 		}
+		sh.mu.Unlock()
 	}
 	return removed
 }
 
 // Exists returns how many of the given keys are present, regardless of type. A
 // key listed more than once is counted once per occurrence — EXISTS k k returns
-// 2 when k exists — matching Redis EXISTS semantics. Read lock.
+// 2 when k exists — matching Redis EXISTS semantics. Read lock (per key's shard).
 func (db *DB) Exists(keys ...string) int {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
 	count := 0
 	for _, key := range keys {
-		if _, ok := db.peek(key); ok {
+		sh := db.shardFor(key)
+		sh.mu.RLock()
+		if _, ok := sh.peek(key); ok {
 			count++
 		}
+		sh.mu.RUnlock()
 	}
 	return count
 }
@@ -195,15 +173,15 @@ func (db *DB) Exists(keys ...string) int {
 
 // listEntry returns the list Entry at key for mutation, creating an empty one if
 // the key is absent and create is true. It returns ErrWrongType if the key holds
-// a non-list value. Callers must hold the write lock.
-func (db *DB) listEntry(key string, create bool) (*Entry, error) {
-	e, ok := db.liveEntry(key)
+// a non-list value. Callers must hold the shard's write lock.
+func (sh *shard) listEntry(key string, create bool) (*Entry, error) {
+	e, ok := sh.liveEntry(key)
 	if !ok {
 		if !create {
 			return nil, nil
 		}
 		e = &Entry{kind: kindList}
-		db.data[key] = e
+		sh.data[key] = e
 		return e, nil
 	}
 	if e.kind != kindList {
@@ -217,10 +195,11 @@ func (db *DB) listEntry(key string, create bool) (*Entry, error) {
 // one at a time, so "LPUSH k a b c" leaves the list as [c b a] — the new values
 // end up in front, in reverse order. WRONGTYPE if key holds a non-list. Write lock.
 func (db *DB) LPush(key string, values ...[]byte) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.listEntry(key, true)
+	e, err := sh.listEntry(key, true)
 	if err != nil {
 		return 0, err
 	}
@@ -237,10 +216,11 @@ func (db *DB) LPush(key string, values ...[]byte) (int, error) {
 // the key does not exist, and returns the list's new length. "RPUSH k a b c"
 // leaves [a b c]. WRONGTYPE if key holds a non-list. Write lock.
 func (db *DB) RPush(key string, values ...[]byte) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.listEntry(key, true)
+	e, err := sh.listEntry(key, true)
 	if err != nil {
 		return 0, err
 	}
@@ -256,10 +236,11 @@ func (db *DB) RPush(key string, values ...[]byte) (int, error) {
 // empties the list the key is deleted, matching Redis (empty lists do not
 // linger). WRONGTYPE if key holds a non-list. Write lock.
 func (db *DB) LPop(key string) ([]byte, bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.listEntry(key, false)
+	e, err := sh.listEntry(key, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -270,7 +251,7 @@ func (db *DB) LPop(key string) ([]byte, bool, error) {
 	v := e.list[0]
 	e.list = e.list[1:]
 	if len(e.list) == 0 {
-		delete(db.data, key)
+		delete(sh.data, key)
 	}
 	return v, true, nil
 }
@@ -279,10 +260,11 @@ func (db *DB) LPop(key string) ([]byte, bool, error) {
 // reports false for a missing/empty list and deletes the key when the list
 // becomes empty. WRONGTYPE if key holds a non-list. Write lock.
 func (db *DB) RPop(key string) ([]byte, bool, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.listEntry(key, false)
+	e, err := sh.listEntry(key, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -294,7 +276,7 @@ func (db *DB) RPop(key string) ([]byte, bool, error) {
 	v := e.list[n-1]
 	e.list = e.list[:n-1]
 	if len(e.list) == 0 {
-		delete(db.data, key)
+		delete(sh.data, key)
 	}
 	return v, true, nil
 }
@@ -302,10 +284,11 @@ func (db *DB) RPop(key string) ([]byte, bool, error) {
 // LLen returns the length of the list at key, or 0 if the key is absent.
 // WRONGTYPE if key holds a non-list. Read lock.
 func (db *DB) LLen(key string) (int, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return 0, nil
 	}
@@ -323,10 +306,11 @@ func (db *DB) LLen(key string) (int, error) {
 // The returned slices alias the stored elements, so callers must treat them as
 // read-only.
 func (db *DB) LRange(key string, start, stop int) ([][]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return [][]byte{}, nil
 	}
@@ -382,15 +366,15 @@ func normalizeRange(start, stop, n int) (lo, hi int, ok bool) {
 
 // hashEntry returns the hash Entry at key for mutation, creating an empty one if
 // the key is absent and create is true. It returns ErrWrongType if the key holds
-// a non-hash value. Callers must hold the write lock.
-func (db *DB) hashEntry(key string, create bool) (*Entry, error) {
-	e, ok := db.liveEntry(key)
+// a non-hash value. Callers must hold the shard's write lock.
+func (sh *shard) hashEntry(key string, create bool) (*Entry, error) {
+	e, ok := sh.liveEntry(key)
 	if !ok {
 		if !create {
 			return nil, nil
 		}
 		e = &Entry{kind: kindHash, hash: make(map[string][]byte)}
-		db.data[key] = e
+		sh.data[key] = e
 		return e, nil
 	}
 	if e.kind != kindHash {
@@ -405,10 +389,11 @@ func (db *DB) hashEntry(key string, create bool) (*Entry, error) {
 // fields that already existed are overwritten but not counted, matching Redis
 // HSET. WRONGTYPE if key holds a non-hash. Write lock.
 func (db *DB) HSet(key string, fields, values [][]byte) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.hashEntry(key, true)
+	e, err := sh.hashEntry(key, true)
 	if err != nil {
 		return 0, err
 	}
@@ -428,10 +413,11 @@ func (db *DB) HSet(key string, fields, values [][]byte) (int, error) {
 // present. A missing key and a missing field both report false. WRONGTYPE if key
 // holds a non-hash. The returned slice aliases the stored value (read-only). Read lock.
 func (db *DB) HGet(key, field string) ([]byte, bool, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return nil, false, nil
 	}
@@ -450,10 +436,11 @@ func (db *DB) HGet(key, field string) ([]byte, bool, error) {
 // removed the key is deleted. A missing key removes nothing. WRONGTYPE if key
 // holds a non-hash. Write lock.
 func (db *DB) HDel(key string, fields ...string) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.hashEntry(key, false)
+	e, err := sh.hashEntry(key, false)
 	if err != nil {
 		return 0, err
 	}
@@ -469,7 +456,7 @@ func (db *DB) HDel(key string, fields ...string) (int, error) {
 		}
 	}
 	if len(e.hash) == 0 {
-		delete(db.data, key)
+		delete(sh.data, key)
 	}
 	return removed, nil
 }
@@ -479,10 +466,11 @@ func (db *DB) HDel(key string, fields ...string) (int, error) {
 // empty slices. WRONGTYPE if key holds a non-hash. Values alias the stored bytes
 // (read-only). Read lock.
 func (db *DB) HGetAll(key string) (fields, values [][]byte, err error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return [][]byte{}, [][]byte{}, nil
 	}
@@ -502,10 +490,11 @@ func (db *DB) HGetAll(key string) (fields, values [][]byte, err error) {
 // HKeys returns the field names of the hash at key (unspecified order); a missing
 // key yields an empty slice. WRONGTYPE if key holds a non-hash. Read lock.
 func (db *DB) HKeys(key string) ([][]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return [][]byte{}, nil
 	}
@@ -524,10 +513,11 @@ func (db *DB) HKeys(key string) ([][]byte, error) {
 // empty slice. Values alias the stored bytes (read-only). WRONGTYPE if key holds
 // a non-hash. Read lock.
 func (db *DB) HVals(key string) ([][]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return [][]byte{}, nil
 	}
@@ -544,10 +534,11 @@ func (db *DB) HVals(key string) ([][]byte, error) {
 // HLen returns the number of fields in the hash at key, or 0 if the key is
 // absent. WRONGTYPE if key holds a non-hash. Read lock.
 func (db *DB) HLen(key string) (int, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return 0, nil
 	}
@@ -569,15 +560,15 @@ func (db *DB) HLen(key string) (int, error) {
 
 // setEntry returns the set Entry at key for mutation, creating an empty one if
 // the key is absent and create is true. It returns ErrWrongType if the key holds
-// a non-set value. Callers must hold the write lock.
-func (db *DB) setEntry(key string, create bool) (*Entry, error) {
-	e, ok := db.liveEntry(key)
+// a non-set value. Callers must hold the shard's write lock.
+func (sh *shard) setEntry(key string, create bool) (*Entry, error) {
+	e, ok := sh.liveEntry(key)
 	if !ok {
 		if !create {
 			return nil, nil
 		}
 		e = &Entry{kind: kindSet, set: make(map[string]struct{})}
-		db.data[key] = e
+		sh.data[key] = e
 		return e, nil
 	}
 	if e.kind != kindSet {
@@ -590,10 +581,11 @@ func (db *DB) setEntry(key string, create bool) (*Entry, error) {
 // exist, and returns how many members were NEWLY added (members already present
 // are ignored). WRONGTYPE if key holds a non-set. Write lock.
 func (db *DB) SAdd(key string, members ...[]byte) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.setEntry(key, true)
+	e, err := sh.setEntry(key, true)
 	if err != nil {
 		return 0, err
 	}
@@ -614,10 +606,11 @@ func (db *DB) SAdd(key string, members ...[]byte) (int, error) {
 // key is deleted. A missing key removes nothing. WRONGTYPE if key holds a
 // non-set. Write lock.
 func (db *DB) SRem(key string, members ...[]byte) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	sh := db.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	e, err := db.setEntry(key, false)
+	e, err := sh.setEntry(key, false)
 	if err != nil {
 		return 0, err
 	}
@@ -634,7 +627,7 @@ func (db *DB) SRem(key string, members ...[]byte) (int, error) {
 		}
 	}
 	if len(e.set) == 0 {
-		delete(db.data, key)
+		delete(sh.data, key)
 	}
 	return removed, nil
 }
@@ -642,10 +635,11 @@ func (db *DB) SRem(key string, members ...[]byte) (int, error) {
 // SIsMember reports whether member is in the set at key. A missing key is an
 // empty set, so it reports false. WRONGTYPE if key holds a non-set. Read lock.
 func (db *DB) SIsMember(key string, member []byte) (bool, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return false, nil
 	}
@@ -659,10 +653,11 @@ func (db *DB) SIsMember(key string, member []byte) (bool, error) {
 // SMembers returns all members of the set at key (unspecified order). A missing
 // key yields an empty slice. WRONGTYPE if key holds a non-set. Read lock.
 func (db *DB) SMembers(key string) ([][]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return [][]byte{}, nil
 	}
@@ -679,10 +674,11 @@ func (db *DB) SMembers(key string) ([][]byte, error) {
 // SCard returns the cardinality (number of members) of the set at key, or 0 if
 // the key is absent. WRONGTYPE if key holds a non-set. Read lock.
 func (db *DB) SCard(key string) (int, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	sh := db.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	e, ok := db.peek(key)
+	e, ok := sh.peek(key)
 	if !ok {
 		return 0, nil
 	}

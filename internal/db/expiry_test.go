@@ -10,17 +10,24 @@ import (
 // keys with a specific expireAt (including ones already in the past) and exercise
 // the expiry machinery deterministically without sleeping.
 func put(d *DB, key string, e *Entry) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data[key] = e
+	sh := d.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.data[key] = e
 }
 
 // rawLen reports how many keys physically remain in the store, expired or not, so
-// tests can assert actual reclamation rather than just external visibility.
+// tests can assert actual reclamation rather than just external visibility. It
+// sums every shard's map, RLocking one at a time.
 func rawLen(d *DB) int {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return len(d.data)
+	n := 0
+	for i := range d.shards {
+		sh := &d.shards[i]
+		sh.mu.RLock()
+		n += len(sh.data)
+		sh.mu.RUnlock()
+	}
+	return n
 }
 
 func TestExpiredPredicate(t *testing.T) {

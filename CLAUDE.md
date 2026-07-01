@@ -178,6 +178,12 @@ _Last updated: 2026-07-01._
   (`Replica.Acked`, an atomic) and logs a warning for any replica silent for >30s
   (`StaleReplicas`). The ack is one-way — the primary sends no reply — so it can't
   desync the replica's inbound stream.
+  **Initial sync — option 1, no bootstrap (Day 17):** deliberately no state
+  transfer on connect. A restarted replica comes up EMPTY and accepts only new
+  writes — which holds emergently, because a read-only replica never writes its own
+  AOF (client writes are refused; the primary's stream is applied via `Dispatch`,
+  bypassing the AOF), so there is nothing to reload. The documented upgrade
+  (option 2) is a synthetic-command snapshot streamed before the live feed.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
   `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`),
   `--appendfsync` (default `everysec`) and `--replicaof` (default off; `"host port"`
@@ -197,10 +203,11 @@ _Last updated: 2026-07-01._
   (cross-connection delivery, fan-out, publish-to-nobody), plus
   `tests/integration/replication_test.go` (replica mirrors post-handshake writes;
   pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract;
-  a replica rejects client writes with `READONLY` while still serving reads) and
-  `internal/replication` white-box tests (`Propagate` enqueues per replica, drops
-  without blocking on a full queue, `Remove` closes the feed safely, and
-  `StaleReplicas` flags a replica that stops acking heartbeats).
+  a replica rejects client writes with `READONLY` while still serving reads; a
+  restarted replica starts empty and only takes new writes — the Day-17 no-initial-
+  sync contract) and `internal/replication` white-box tests (`Propagate` enqueues
+  per replica, drops without blocking on a full queue, `Remove` closes the feed
+  safely, and `StaleReplicas` flags a replica that stops acking heartbeats).
 
 ### Scaffolded (not yet implemented — empty stub files)
 - Store internals: `shard` (`internal/db/`).

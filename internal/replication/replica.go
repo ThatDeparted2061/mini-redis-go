@@ -25,11 +25,14 @@ const reconnectDelay = time.Second
 // it makes down the same connection. For each streamed command RunReplica calls
 // apply — the server passes a closure that dispatches it into the local db.
 //
-// v1 LIMITATION — no snapshot bootstrap. The replica only receives writes the
-// primary makes AFTER the handshake; whatever data already lives on the primary
-// is NOT transferred. A replica therefore mirrors the primary only for keys
-// written after it connected. (The fix — streaming the primary's existing
-// keyspace as a snapshot before the live stream — is the documented upgrade.)
+// INITIAL SYNC — option 1, no bootstrap (Day 17). The replica only receives
+// writes the primary makes AFTER the handshake; whatever data already lives on the
+// primary is NOT transferred, and a restarted replica comes up empty (it keeps no
+// prior state, since a read-only replica never writes its own AOF). A replica
+// therefore mirrors the primary only for keys written after it connected. This is
+// the deliberate "two-line" choice; the documented upgrade (option 2) is for the
+// primary to iterate its keyspace on REPLICAOF and send one synthetic SET/HSET/…
+// per entry before the live stream, which the replica would apply identically.
 func RunReplica(ctx context.Context, primaryAddr string, apply func(protocol.Value)) {
 	for ctx.Err() == nil {
 		if err := streamOnce(ctx, primaryAddr, apply); err != nil {

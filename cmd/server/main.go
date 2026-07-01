@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/persistence"
@@ -17,11 +18,24 @@ func main() {
 	appendOnly := flag.Bool("appendonly", true, "persist writes to an append-only file and recover them on restart")
 	aofPath := flag.String("aof-path", persistence.DefaultFilename, "path to the append-only file")
 	appendFsync := flag.String("appendfsync", "everysec", "AOF fsync policy: always | everysec | no")
+	replicaOf := flag.String("replicaof", "", `replicate from a primary, given as "host port" (e.g. --replicaof "127.0.0.1 6380")`)
 	flag.Parse()
 
 	fsyncMode, err := persistence.ParseFsyncMode(*appendFsync)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// --replicaof "host port" makes this server a replica of that primary. Redis
+	// takes the address as two space-separated fields, so we accept the same shape
+	// and join them into a dial target.
+	var primaryAddr string
+	if *replicaOf != "" {
+		fields := strings.Fields(*replicaOf)
+		if len(fields) != 2 {
+			log.Fatalf(`--replicaof must be "host port", got %q`, *replicaOf)
+		}
+		primaryAddr = net.JoinHostPort(fields[0], fields[1])
 	}
 
 	// Open the listener here (not inside the server) so a bad address or a
@@ -46,6 +60,10 @@ func main() {
 	if *appendOnly {
 		opts = append(opts, server.WithAOF(*aofPath), server.WithFsync(fsyncMode))
 		log.Printf("append-only persistence on: %s (appendfsync=%s)", *aofPath, fsyncMode)
+	}
+	if primaryAddr != "" {
+		opts = append(opts, server.WithReplicaOf(primaryAddr))
+		log.Printf("replica mode: streaming live writes from primary %s", primaryAddr)
 	}
 
 	srv := server.New(ln, opts...)

@@ -16,6 +16,7 @@ import (
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/persistence"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/replication"
 )
 
 // Server owns the TCP listener and the one shared database used by every
@@ -44,8 +45,17 @@ type Server struct {
 	// See apply for why that invariant matters. The AOF compactor also holds it
 	// for the duration of a rewrite, so no write slips into the gap between
 	// snapshotting the keyspace and swapping in the compacted log — see
-	// rewriteAOF.
+	// rewriteAOF. Replica propagation runs under it too, so replicas receive
+	// writes in the same order the store applied them.
 	writeMu sync.Mutex
+
+	// replicas is the set of connected replicas this server streams its writes to
+	// (its role as a PRIMARY). Always non-nil; empty until a replica connects.
+	replicas *replication.Replicas
+
+	// primaryAddr, when set (--replicaof), makes this server a REPLICA: Serve
+	// launches a goroutine that streams the primary's writes into the local db.
+	primaryAddr string
 }
 
 // autoRewriteInterval is how often the background compactor checks whether the
@@ -71,14 +81,23 @@ func WithFsync(mode persistence.FsyncMode) Option {
 	return func(s *Server) { s.fsyncMode = mode }
 }
 
+// WithReplicaOf makes this server a REPLICA of the primary at addr ("host:port").
+// On Serve it dials the primary, performs the REPLICAOF handshake, and applies
+// the primary's live write stream into the local store. An empty addr leaves the
+// server as a standalone primary.
+func WithReplicaOf(addr string) Option {
+	return func(s *Server) { s.primaryAddr = addr }
+}
+
 // New builds a Server around an already-open listener and a fresh, empty
 // database. The caller owns creating the listener (so it controls the address,
 // and so listen errors surface in main before we start serving). Options enable
 // optional features such as persistence (WithAOF).
 func New(ln net.Listener, opts ...Option) *Server {
 	s := &Server{
-		ln: ln,
-		db: db.New(),
+		ln:       ln,
+		db:       db.New(),
+		replicas: replication.NewReplicas(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -140,6 +159,23 @@ func (s *Server) Serve(ctx context.Context) error {
 		close(rewriteDone)
 	}
 
+	// When --replicaof is set this server is a replica: stream the primary's live
+	// writes into the local db for the server's lifetime. Like the goroutines
+	// above it stops on ctx cancel and is waited out on shutdown. Streamed writes
+	// go straight through Dispatch (not apply) — a replica mirrors, it does not
+	// re-log or chain-propagate in v1.
+	replicaDone := make(chan struct{})
+	if s.primaryAddr != "" {
+		go func() {
+			defer close(replicaDone)
+			replication.RunReplica(ctx, s.primaryAddr, func(c protocol.Value) {
+				cmd.Dispatch(s.db, c)
+			})
+		}()
+	} else {
+		close(replicaDone)
+	}
+
 	// wg tracks live connection goroutines so we can wait them out on shutdown
 	// rather than yanking the process out from under in-flight requests.
 	var wg sync.WaitGroup
@@ -167,6 +203,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	wg.Wait()
 	<-expiryDone
 	<-rewriteDone
+	<-replicaDone
 	return nil
 }
 
@@ -255,21 +292,26 @@ func (s *Server) loadAOF() error {
 	return nil
 }
 
-// apply runs request against the shared database and, when persistence is on and
-// the command both writes and succeeds, appends it to the log.
+// apply runs request against the shared database and, when the command both
+// writes and succeeds, records its effect downstream: appends it to the AOF (when
+// persistence is on) and streams it to every connected replica (when there are
+// any).
 //
-// The write path holds writeMu across BOTH the dispatch and the append. That is
-// the crux of correctness under concurrency: handlers run in many goroutines, and
-// without this lock two writers could mutate the database in one order yet reach
-// the log in the other — a replay would then rebuild a DIFFERENT state than the
-// one that was live. Holding writeMu makes "apply then record" atomic per write,
-// so the log's order always matches the database's. Reads never take writeMu, so
-// they still run fully in parallel under the database's own read lock.
+// The write path holds writeMu across the dispatch AND both downstream effects.
+// That is the crux of correctness under concurrency: handlers run in many
+// goroutines, and without this lock two writers could mutate the database in one
+// order yet reach the log (or a replica) in the other — a replay or a replica
+// would then rebuild a DIFFERENT state than the one that was live. Holding writeMu
+// makes "apply then record then propagate" atomic per write, so the log's and the
+// replicas' order always matches the database's. Reads never take writeMu, so they
+// still run fully in parallel under the database's own read lock.
 //
-// Only non-error replies are logged: a command that failed (wrong arguments,
-// WRONGTYPE, ...) changed nothing, so there is nothing to persist.
+// Only non-error replies are recorded: a command that failed (wrong arguments,
+// WRONGTYPE, ...) changed nothing, so there is nothing to persist or propagate.
 func (s *Server) apply(request protocol.Value) protocol.Value {
-	if s.aof == nil || !cmd.IsWrite(commandName(request)) {
+	// Fast lock-free path: read-only commands, and writes when there is neither an
+	// AOF to append to nor a replica to stream to, need no ordering guarantee.
+	if !cmd.IsWrite(commandName(request)) || (s.aof == nil && !s.replicas.Any()) {
 		return cmd.Dispatch(s.db, request)
 	}
 
@@ -278,12 +320,17 @@ func (s *Server) apply(request protocol.Value) protocol.Value {
 
 	reply := cmd.Dispatch(s.db, request)
 	if reply.Type != protocol.TypeError {
-		if err := s.aof.Append(request); err != nil {
-			// The mutation already happened in memory; we just failed to make it
-			// durable. Surface it loudly — a later crash would lose this write —
-			// but still return the reply the client earned.
-			log.Printf("aof append failed for %q: %v", commandName(request), err)
+		if s.aof != nil {
+			if err := s.aof.Append(request); err != nil {
+				// The mutation already happened in memory; we just failed to make it
+				// durable. Surface it loudly — a later crash would lose this write —
+				// but still return the reply the client earned.
+				log.Printf("aof append failed for %q: %v", commandName(request), err)
+			}
 		}
+		// Mirror the same successful write to every connected replica, under the
+		// same lock, so replicas receive writes in the store's order.
+		s.replicas.Propagate(request)
 	}
 	return reply
 }

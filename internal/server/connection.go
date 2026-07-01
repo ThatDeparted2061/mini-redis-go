@@ -34,6 +34,12 @@ type connState struct {
 	// mode" and may only run a restricted command set (see serve).
 	sub      *db.Subscriber
 	channels map[string]struct{}
+
+	// isReplica records that this connection issued REPLICAOF and is now a replica
+	// feed; replicaID is its handle in the server's replica registry, used to
+	// unregister it on disconnect. Both are touched only by the request loop.
+	isReplica bool
+	replicaID uint64
 }
 
 // subscribed reports whether the connection is in subscribe mode.
@@ -76,6 +82,7 @@ func (s *Server) handle(conn net.Conn) {
 	// reply. write() Flushes so bytes actually reach the client.
 	cs := &connState{writer: bufio.NewWriter(conn), remote: remote}
 	defer s.unsubscribeAll(cs)
+	defer s.removeReplica(cs)
 
 	reader := bufio.NewReader(conn)
 	for {

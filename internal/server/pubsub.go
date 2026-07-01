@@ -43,6 +43,10 @@ func (s *Server) serve(cs *connState, request protocol.Value) bool {
 		return s.subscribe(cs, request.Array[1:])
 	case "UNSUBSCRIBE":
 		return s.unsubscribe(cs, request.Array[1:])
+	case "REPLICAOF":
+		// Handled here, not via cmd.Dispatch, because (like SUBSCRIBE) it acts on
+		// the CONNECTION: it turns this socket into a replica feed.
+		return s.replicaof(cs)
 	case "QUIT":
 		// QUIT acknowledges and closes, in any mode.
 		_ = cs.write(okVal())

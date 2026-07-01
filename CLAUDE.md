@@ -61,7 +61,7 @@ Keep the summary truthful: an empty stub file is "scaffolded", not "done".
 
 ## Project status
 
-_Last updated: 2026-06-26._
+_Last updated: 2026-07-01._
 
 ### Implemented
 - **RESP2 protocol** (`internal/protocol`): decoder, encoder, value model, with
@@ -140,9 +140,31 @@ _Last updated: 2026-06-26._
   design: writes pause so no command slips into the gap between snapshot and
   swap, at the cost of a write-latency hit (Redis avoids it with a fork/COW child;
   that's the upgrade path).
+- **Replication — primary/replica live stream**
+  (`internal/replication/{primary,replica}.go`, `internal/server/replication.go`):
+  a primary streams every successful write to each connected replica, which
+  applies it into its own store. A replica (`--replicaof "host port"`) dials the
+  primary, sends a one-shot `REPLICAOF` handshake, gets `+OK`, then `Decode`s the
+  live command stream and re-dispatches each frame through `cmd.Dispatch`
+  (`RunReplica`, retrying every 1s until ctx cancel; the socket is closed on
+  shutdown to unblock the read). On the primary, `REPLICAOF` is intercepted at the
+  connection level (like `SUBSCRIBE`, not via `cmd.Dispatch`): `replicaof` writes
+  the `+OK` ack BEFORE registering the connection's `cs.write` as a replica feed in
+  the process-wide `replication.Replicas` registry, so a concurrent write can't
+  race ahead of the ack. Propagation runs in `apply` under the same `writeMu` as
+  the dispatch and AOF append, so replicas receive writes in exactly the store's
+  order; the fast lock-free path is taken only when there is neither an AOF nor any
+  replica. Feeds unregister on disconnect (`removeReplica`, deferred in `handle`).
+  v1 trade-offs, both flagged in-code with upgrade paths: NO snapshot bootstrap (a
+  replica only mirrors writes made AFTER it connects — pre-existing keys are not
+  transferred), and a BLOCKING synchronous fan-out under `writeMu` (one slow
+  replica stalls all writes; real Redis uses per-replica buffered output queues
+  with disconnect-on-overflow). Streamed writes go straight through `Dispatch`, so
+  a replica does not re-log to its own AOF or chain-propagate.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
-  `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`) and
-  `--appendfsync` (default `everysec`).
+  `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`),
+  `--appendfsync` (default `everysec`) and `--replicaof` (default off; `"host port"`
+  makes the server a replica of that primary).
 - **Tests**: `internal/cmd` unit tests (dispatch, lists, hashes, sets, expiry,
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
   resurrection of expired keys on write), `internal/persistence` unit tests
@@ -155,14 +177,17 @@ _Last updated: 2026-06-26._
   not persisted, concurrent-write replay ordering, and rewrite-then-restart
   recovery), plus `internal/db` broker tests (fan-out, payload copy, slow-
   subscriber drop, unsubscribe cleanup) and `tests/integration/pubsub_test.go`
-  (cross-connection delivery, fan-out, publish-to-nobody).
+  (cross-connection delivery, fan-out, publish-to-nobody), plus
+  `tests/integration/replication_test.go` (replica mirrors post-handshake writes;
+  pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract).
 
 ### Scaffolded (not yet implemented — empty stub files)
-- Commands: replication (`internal/cmd/replication.go`).
 - Store internals: `shard` (`internal/db/`).
-- Replication: `internal/replication/{primary,replica}.go`.
 - Metrics: `internal/metrics/metrics.go`.
-- Tests: `tests/integration/replication_test.go`, `tests/chaos/*`.
+- Tests: `tests/chaos/*`.
+- Note: `internal/cmd/replication.go` is a vestigial stub — `REPLICAOF` is handled
+  at the connection level (`internal/server/replication.go`), not as a `cmd`
+  handler, so nothing lives in that file.
 
 ### Known gaps (intentionally unimplemented)
 - **Sorted sets** (`ZADD`, `ZRANGE`, `ZSCORE`, …) are deliberately skipped.
@@ -180,10 +205,11 @@ _Last updated: 2026-06-26._
 Request flow for one client command:
 
 ```
-TCP conn → protocol.Decode → server.serve ┬→ SUBSCRIBE/UNSUBSCRIBE (connection-level) ┐
-                                           ├→ server.apply ┬→ cmd.Dispatch → handler   │
-                                           │               └→ (write & ok) AOF append   │
-                                           └→ QUIT / subscribe-mode guard               │
+TCP conn → protocol.Decode → server.serve ┬→ SUBSCRIBE/UNSUBSCRIBE/REPLICAOF (connection-level) ┐
+                                           ├→ server.apply ┬→ cmd.Dispatch → handler            │
+                                           │               ├→ (write & ok) AOF append           │
+                                           │               └→ (write & ok) replicas.Propagate   │
+                                           └→ QUIT / subscribe-mode guard                        │
                                                           protocol.Encode → TCP conn
 ```
 
@@ -202,10 +228,20 @@ it only needs the broker, reachable via `db.PubSub()`. Each connection has a
 `writeMu` (separate from the server-wide AOF `writeMu`) serialising socket writes
 so a pushed message can't interleave with a reply.
 
+`REPLICAOF` is the same kind of exception: it acts on the connection, turning the
+socket into a replica feed registered in the `replication.Replicas` registry, so
+`server.serve` handles it directly too. On the write path, `apply` propagates each
+successful write to those feeds under the server-wide `writeMu` (alongside the AOF
+append), so every replica sees writes in the store's order. A replica server
+(`--replicaof`) runs the mirror side as a lifecycle goroutine (`RunReplica`) that
+streams the primary's writes back through `cmd.Dispatch`.
+
 ## Build / test / run
 
 ```bash
-go run ./cmd/server --port 6380     # start the server
+go run ./cmd/server --port 6380     # start the server (a primary)
+go run ./cmd/server --port 6381 --appendonly=false \
+  --replicaof "127.0.0.1 6380"      # start a replica of that primary
 redis-cli -p 6380                   # connect a real client
 go test ./...                       # run everything
 go test ./tests/integration/ -v     # integration tests only

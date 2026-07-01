@@ -30,6 +30,17 @@ go test ./...                                         # run everything
 go test -race ./...                                   # run with the race detector
 ```
 
+## Demo
+
+A scripted end-to-end run — the primary starting, `redis-cli` issuing a few
+commands, a replica attaching, and a primary write appearing on the replica — is
+recorded in [`demo/demo.cast`](demo/demo.cast):
+
+```bash
+asciinema play demo/demo.cast      # replay the recording
+bash demo/demo.sh                  # …or run it live
+```
+
 ## Commands supported
 
 | Type     | Commands                                                        |

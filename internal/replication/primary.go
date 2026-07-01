@@ -6,50 +6,77 @@
 // v1 has no snapshot bootstrap: a replica only ever sees writes the primary makes
 // AFTER it connects (see RunReplica's doc for the consequence). The registry here
 // is deliberately tiny — it is just "who is listening to my writes right now".
+//
+// Write log shipping (Day 15): propagation is DECOUPLED from the socket. Each
+// replica owns a buffered queue of already-serialised RESP frames; Propagate does
+// a NON-BLOCKING enqueue into every queue and returns immediately, and a
+// per-replica delivery goroutine (server.deliverReplica) drains the queue to the
+// socket. This is the same shape as the pub/sub bus (db.Broker): the buffer
+// absorbs bursts, and a slow replica that overruns its queue can no longer stall
+// the primary's write path.
 package replication
 
 import (
+	"bytes"
 	"log"
 	"sync"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
 
+// replicaQueueCap is how many undelivered write frames a replica's queue holds
+// before Propagate starts dropping for it. Matches the pub/sub mailbox cap: a few
+// hundred absorbs normal bursts without letting a stuck replica pin unbounded
+// memory.
+const replicaQueueCap = 256
+
+// Replica is one connected replica's outgoing feed: a buffered queue of serialised
+// RESP write frames. Propagate writes into ch; the connection's delivery goroutine
+// drains it to the socket.
+type Replica struct {
+	id   uint64
+	addr string // for logging only
+	ch   chan []byte
+}
+
+// Feed is the receive end the delivery goroutine ranges over.
+func (rep *Replica) Feed() <-chan []byte { return rep.ch }
+
 // Replicas is the set of replica feeds a primary is currently streaming to. It is
 // shared process-wide (one per server) and safe for concurrent use.
-//
-// A "feed" is just a function that writes one command frame to one replica's
-// socket. The server supplies its per-connection write method (the same one that
-// serialises pub/sub pushes against replies), so propagation reuses that
-// machinery instead of touching sockets itself — and so a replica feed can never
-// interleave with the +OK handshake ack on the same connection.
 type Replicas struct {
 	mu   sync.RWMutex
 	next uint64
-	feed map[uint64]func(protocol.Value) error
+	reps map[uint64]*Replica
 }
 
 // NewReplicas returns an empty registry ready to accept replica feeds.
 func NewReplicas() *Replicas {
-	return &Replicas{feed: make(map[uint64]func(protocol.Value) error)}
+	return &Replicas{reps: make(map[uint64]*Replica)}
 }
 
-// Add registers a replica feed and returns an id the caller uses to Remove it
-// when the replica disconnects.
-func (r *Replicas) Add(write func(protocol.Value) error) uint64 {
+// Add registers a new replica (identified by addr for logging) and returns it. The
+// caller starts a delivery goroutine draining rep.Feed() and passes the same
+// *Replica to Remove on disconnect.
+func (r *Replicas) Add(addr string) *Replica {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	id := r.next
+	rep := &Replica{id: r.next, addr: addr, ch: make(chan []byte, replicaQueueCap)}
 	r.next++
-	r.feed[id] = write
-	return id
+	r.reps[rep.id] = rep
+	return rep
 }
 
-// Remove drops a replica feed (on disconnect). Removing an unknown id is a no-op.
-func (r *Replicas) Remove(id uint64) {
+// Remove drops a replica (on disconnect) and closes its queue, which ends the
+// delivery goroutine's range loop. Removing from the map (under the write lock)
+// BEFORE closing is what makes the close safe: once Remove holds the lock no
+// Propagate (a reader) is mid-send, and any later Propagate won't find rep — so
+// nothing can send on the closed channel. Same ordering rule as pubsub teardown.
+func (r *Replicas) Remove(rep *Replica) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.feed, id)
+	delete(r.reps, rep.id)
+	r.mu.Unlock()
+	close(rep.ch)
 }
 
 // Any reports whether any replica is connected. The write path checks it to skip
@@ -57,33 +84,39 @@ func (r *Replicas) Remove(id uint64) {
 func (r *Replicas) Any() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.feed) > 0
+	return len(r.reps) > 0
 }
 
-// Propagate streams one write command to every connected replica. The caller
-// invokes it under the server's writeMu, so commands are propagated one at a time
-// in exactly the order the store applied them — which is what keeps a replica's
-// state in step with the primary's.
+// Propagate serialises one write command ONCE and enqueues the resulting frame to
+// every connected replica. The caller invokes it under the server's writeMu, so
+// commands are enqueued one at a time in exactly the order the store applied them;
+// each replica's queue is FIFO, so the delivery goroutine writes them out in that
+// same order — which is what keeps a replica in step with the primary.
 //
-// It snapshots the feeds under the lock and writes outside it, so a slow replica's
-// socket does not block another replica registering or disconnecting. A failed
-// write is only logged here: the broken replica's read loop notices the same
-// break and Removes itself.
+// The send is NON-BLOCKING and done under the read lock (safe because it never
+// blocks): if a replica's queue is full it is DROPPED with a logged warning rather
+// than stalling the write path. The single frame is shared read-only across all
+// replicas — it is freshly allocated here and the delivery goroutines only read it.
 //
-// ponytail: a blocking socket write means one slow replica stalls ALL writes
-// (Propagate runs under writeMu). Upgrade path: a per-replica buffered output
-// queue with disconnect-on-overflow, as real Redis does.
+// ponytail: DROP-and-log means a slow replica silently DRIFTS out of sync and,
+// with no snapshot bootstrap, can't recover without a restart. Upgrade path (real
+// Redis): disconnect the replica on overflow so it reconnects and re-syncs, or
+// spill its backlog to disk. Kept as drop-and-log for v1, matching pub/sub.
 func (r *Replicas) Propagate(cmd protocol.Value) {
-	r.mu.RLock()
-	feeds := make([]func(protocol.Value) error, 0, len(r.feed))
-	for _, w := range r.feed {
-		feeds = append(feeds, w)
+	var buf bytes.Buffer
+	if err := protocol.Encode(&buf, cmd); err != nil {
+		log.Printf("replication: encode for propagation failed: %v", err)
+		return
 	}
-	r.mu.RUnlock()
+	frame := buf.Bytes()
 
-	for _, write := range feeds {
-		if err := write(cmd); err != nil {
-			log.Printf("replication: propagate to replica failed: %v", err)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, rep := range r.reps {
+		select {
+		case rep.ch <- frame:
+		default:
+			log.Printf("replication: replica %s queue full, dropping write — replica will drift and needs a resync", rep.addr)
 		}
 	}
 }

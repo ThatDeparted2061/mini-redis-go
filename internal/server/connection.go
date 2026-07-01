@@ -10,6 +10,7 @@ import (
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/replication"
 )
 
 // connState is the per-connection state the request loop and the pub/sub
@@ -35,11 +36,10 @@ type connState struct {
 	sub      *db.Subscriber
 	channels map[string]struct{}
 
-	// isReplica records that this connection issued REPLICAOF and is now a replica
-	// feed; replicaID is its handle in the server's replica registry, used to
-	// unregister it on disconnect. Both are touched only by the request loop.
-	isReplica bool
-	replicaID uint64
+	// replica is non-nil once this connection issued REPLICAOF: it is the
+	// connection's feed in the server's replica registry (its outgoing write
+	// queue), used to unregister it on disconnect. Mirrors sub above.
+	replica *replication.Replica
 }
 
 // subscribed reports whether the connection is in subscribe mode.
@@ -53,6 +53,25 @@ func (cs *connState) write(v protocol.Value) error {
 	defer cs.writeMu.Unlock()
 
 	if err := protocol.Encode(cs.writer, v); err != nil {
+		log.Printf("write error to %s: %v", cs.remote, err)
+		return err
+	}
+	if err := cs.writer.Flush(); err != nil {
+		log.Printf("flush error to %s: %v", cs.remote, err)
+		return err
+	}
+	return nil
+}
+
+// writeRaw flushes an already-serialised RESP frame to the socket as one atomic
+// write, holding writeMu just like write. The replica delivery goroutine uses it
+// to ship pre-encoded write frames (Propagate serialises once, up front) without
+// re-encoding a protocol.Value per replica.
+func (cs *connState) writeRaw(frame []byte) error {
+	cs.writeMu.Lock()
+	defer cs.writeMu.Unlock()
+
+	if _, err := cs.writer.Write(frame); err != nil {
 		log.Printf("write error to %s: %v", cs.remote, err)
 		return err
 	}

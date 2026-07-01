@@ -149,18 +149,25 @@ _Last updated: 2026-07-01._
   (`RunReplica`, retrying every 1s until ctx cancel; the socket is closed on
   shutdown to unblock the read). On the primary, `REPLICAOF` is intercepted at the
   connection level (like `SUBSCRIBE`, not via `cmd.Dispatch`): `replicaof` writes
-  the `+OK` ack BEFORE registering the connection's `cs.write` as a replica feed in
-  the process-wide `replication.Replicas` registry, so a concurrent write can't
-  race ahead of the ack. Propagation runs in `apply` under the same `writeMu` as
-  the dispatch and AOF append, so replicas receive writes in exactly the store's
-  order; the fast lock-free path is taken only when there is neither an AOF nor any
-  replica. Feeds unregister on disconnect (`removeReplica`, deferred in `handle`).
-  v1 trade-offs, both flagged in-code with upgrade paths: NO snapshot bootstrap (a
+  the `+OK` ack, then registers the connection in the process-wide
+  `replication.Replicas` registry — where each replica owns a buffered queue of
+  serialised RESP frames (`chan []byte`, cap 256) — and starts a per-replica
+  delivery goroutine (`deliverReplica`) that drains the queue to the socket.
+  **Write log shipping (Day 15):** `apply` serialises each successful write once
+  and `Propagate` does a NON-BLOCKING enqueue into every replica's queue, under the
+  same `writeMu` as the dispatch and AOF append — so replicas receive writes in the
+  store's order without any socket I/O on the write path; the fast lock-free path is
+  taken only when there is neither an AOF nor any replica. A queue that overflows is
+  DROPPED with a log (drop-and-log, same policy as a slow pub/sub subscriber).
+  `Remove` deletes the replica under the write lock BEFORE closing its queue, so a
+  concurrent `Propagate` can never send on a closed channel (mirrors pub/sub
+  teardown); disconnect fires it via `removeReplica`, deferred in `handle`. v1
+  trade-offs, both flagged in-code with upgrade paths: NO snapshot bootstrap (a
   replica only mirrors writes made AFTER it connects — pre-existing keys are not
-  transferred), and a BLOCKING synchronous fan-out under `writeMu` (one slow
-  replica stalls all writes; real Redis uses per-replica buffered output queues
-  with disconnect-on-overflow). Streamed writes go straight through `Dispatch`, so
-  a replica does not re-log to its own AOF or chain-propagate.
+  transferred), and DROP-and-log on overflow (a slow replica silently drifts and,
+  with no bootstrap, can't resync without a restart; real Redis disconnects on
+  overflow so the replica reconnects and re-syncs). Streamed writes go straight
+  through `Dispatch`, so a replica does not re-log to its own AOF or chain-propagate.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
   `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`),
   `--appendfsync` (default `everysec`) and `--replicaof` (default off; `"host port"`
@@ -179,7 +186,9 @@ _Last updated: 2026-07-01._
   subscriber drop, unsubscribe cleanup) and `tests/integration/pubsub_test.go`
   (cross-connection delivery, fan-out, publish-to-nobody), plus
   `tests/integration/replication_test.go` (replica mirrors post-handshake writes;
-  pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract).
+  pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract)
+  and `internal/replication` white-box tests (`Propagate` enqueues per replica,
+  drops without blocking on a full queue, `Remove` closes the feed safely).
 
 ### Scaffolded (not yet implemented — empty stub files)
 - Store internals: `shard` (`internal/db/`).

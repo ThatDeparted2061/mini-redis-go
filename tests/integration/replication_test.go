@@ -9,6 +9,7 @@ package integration
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +81,29 @@ func TestReplicationLiveStream(t *testing.T) {
 	// The pre-handshake write must NOT be on the replica (no bootstrap).
 	if v, err := replica.Get(ctx, "before").Result(); err != redis.Nil {
 		t.Errorf("replica GET before = (%q, %v), want redis.Nil (no snapshot bootstrap)", v, err)
+	}
+}
+
+// TestReplicaIsReadOnly is the Day-16 contract: a replica refuses client writes
+// with a READONLY error, but still serves reads (values streamed from the primary).
+func TestReplicaIsReadOnly(t *testing.T) {
+	primaryAddr, primary := startNamedServer(t)
+	_, replica := startNamedServer(t, server.WithReplicaOf(primaryAddr))
+	waitReplicaReady(t, replica)
+
+	ctx := opCtx(t)
+
+	// A write issued by a client directly to the replica is refused.
+	if err := replica.Set(ctx, "k", "v", 0).Err(); err == nil || !strings.Contains(err.Error(), "READONLY") {
+		t.Fatalf("replica SET error = %v, want a READONLY error", err)
+	}
+
+	// Reads still work: a value written on the primary streams in and is readable.
+	if err := primary.Set(ctx, "streamed", "yes", 0).Err(); err != nil {
+		t.Fatalf("primary set: %v", err)
+	}
+	if got := waitForReplica(t, replica, "streamed"); got != "yes" {
+		t.Errorf("replica GET streamed = %q, want %q", got, "yes")
 	}
 }
 

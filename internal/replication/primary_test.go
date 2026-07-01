@@ -62,3 +62,27 @@ func TestPropagateEnqueuesAndDrops(t *testing.T) {
 	for range rep.Feed() {
 	}
 }
+
+func TestStaleReplicasReportsSilentReplicas(t *testing.T) {
+	reps := NewReplicas()
+	reps.Add("fresh")
+	stale := reps.Add("stale")
+
+	// A just-connected replica is never stale — Add seeds lastAck to connect time.
+	if got := reps.StaleReplicas(30 * time.Second); len(got) != 0 {
+		t.Fatalf("fresh replicas reported stale: %v", got)
+	}
+
+	// Age one replica past the threshold; only it should be reported.
+	stale.lastAck.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	got := reps.StaleReplicas(30 * time.Second)
+	if len(got) != 1 || got[0] != "stale" {
+		t.Fatalf("StaleReplicas = %v, want [stale]", got)
+	}
+
+	// An ack refreshes it back to live.
+	stale.Acked()
+	if got := reps.StaleReplicas(30 * time.Second); len(got) != 0 {
+		t.Fatalf("after Acked, replica still reported stale: %v", got)
+	}
+}

@@ -168,6 +168,16 @@ _Last updated: 2026-07-01._
   with no bootstrap, can't resync without a restart; real Redis disconnects on
   overflow so the replica reconnects and re-syncs). Streamed writes go straight
   through `Dispatch`, so a replica does not re-log to its own AOF or chain-propagate.
+  **Read-only replicas + heartbeat (Day 16):** a replica REJECTS writes from
+  ordinary clients with `-READONLY You can't write against a read only replica.`
+  (the guard sits in `serve`, gated on `--replicaof`), while reads are served
+  normally (eventually consistent with the primary). Liveness runs over the same
+  stream: the primary PINGs every replica every 5s (`runReplicaHeartbeat` →
+  `Replicas.Heartbeat`), each replica answers `REPLCONF ACK` (intercepted in the
+  replica's stream loop, never dispatched), and the primary records the ack time
+  (`Replica.Acked`, an atomic) and logs a warning for any replica silent for >30s
+  (`StaleReplicas`). The ack is one-way — the primary sends no reply — so it can't
+  desync the replica's inbound stream.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
   `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`),
   `--appendfsync` (default `everysec`) and `--replicaof` (default off; `"host port"`
@@ -186,9 +196,11 @@ _Last updated: 2026-07-01._
   subscriber drop, unsubscribe cleanup) and `tests/integration/pubsub_test.go`
   (cross-connection delivery, fan-out, publish-to-nobody), plus
   `tests/integration/replication_test.go` (replica mirrors post-handshake writes;
-  pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract)
-  and `internal/replication` white-box tests (`Propagate` enqueues per replica,
-  drops without blocking on a full queue, `Remove` closes the feed safely).
+  pre-handshake keys are NOT bootstrapped — asserts the v1 no-snapshot contract;
+  a replica rejects client writes with `READONLY` while still serving reads) and
+  `internal/replication` white-box tests (`Propagate` enqueues per replica, drops
+  without blocking on a full queue, `Remove` closes the feed safely, and
+  `StaleReplicas` flags a replica that stops acking heartbeats).
 
 ### Scaffolded (not yet implemented — empty stub files)
 - Store internals: `shard` (`internal/db/`).

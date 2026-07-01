@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"log"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
@@ -37,10 +39,24 @@ type Replica struct {
 	id   uint64
 	addr string // for logging only
 	ch   chan []byte
+
+	// lastAck is the unix-nanos time of this replica's most recent heartbeat ack.
+	// It is atomic because two goroutines touch it without the registry lock: the
+	// connection's read loop stores on each REPLCONF ACK (Acked), and the primary's
+	// heartbeat goroutine loads it to spot silent replicas (StaleReplicas).
+	lastAck atomic.Int64
 }
 
 // Feed is the receive end the delivery goroutine ranges over.
 func (rep *Replica) Feed() <-chan []byte { return rep.ch }
+
+// Acked records that this replica just sent a heartbeat ack (REPLCONF ACK).
+func (rep *Replica) Acked() { rep.lastAck.Store(time.Now().UnixNano()) }
+
+// sinceAck is how long since this replica last acked, measured against now.
+func (rep *Replica) sinceAck(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, rep.lastAck.Load()))
+}
 
 // Replicas is the set of replica feeds a primary is currently streaming to. It is
 // shared process-wide (one per server) and safe for concurrent use.
@@ -62,6 +78,7 @@ func (r *Replicas) Add(addr string) *Replica {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rep := &Replica{id: r.next, addr: addr, ch: make(chan []byte, replicaQueueCap)}
+	rep.lastAck.Store(time.Now().UnixNano()) // count staleness from connect, not zero
 	r.next++
 	r.reps[rep.id] = rep
 	return rep
@@ -119,4 +136,39 @@ func (r *Replicas) Propagate(cmd protocol.Value) {
 			log.Printf("replication: replica %s queue full, dropping write — replica will drift and needs a resync", rep.addr)
 		}
 	}
+}
+
+// Heartbeat streams a PING to every replica and logs a warning for any replica
+// that has not acked within staleAfter. The primary calls it on a fixed interval
+// (server.runReplicaHeartbeat). The PING is also the liveness probe: a live
+// replica answers REPLCONF ACK, which refreshes its ack time via Acked, so a
+// replica only stays "stale" if it is genuinely stuck or gone.
+func (r *Replicas) Heartbeat(staleAfter time.Duration) {
+	r.Propagate(pingCommand())
+	for _, addr := range r.StaleReplicas(staleAfter) {
+		log.Printf("replication: replica %s has not acked a heartbeat in over %s — it may be stuck or gone", addr, staleAfter)
+	}
+}
+
+// StaleReplicas returns the addresses of replicas that have not acked within
+// staleAfter. It is exposed (rather than folded into Heartbeat) so the staleness
+// rule can be unit-tested without waiting on the real heartbeat interval.
+func (r *Replicas) StaleReplicas(staleAfter time.Duration) []string {
+	now := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var stale []string
+	for _, rep := range r.reps {
+		if rep.sinceAck(now) > staleAfter {
+			stale = append(stale, rep.addr)
+		}
+	}
+	return stale
+}
+
+// pingCommand is the heartbeat frame the primary streams to replicas.
+func pingCommand() protocol.Value {
+	return protocol.Value{Type: protocol.TypeArray, Array: []protocol.Value{
+		{Type: protocol.TypeBulkString, Bulk: []byte("PING")},
+	}}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
@@ -75,7 +76,8 @@ func streamOnce(ctx context.Context, primaryAddr string, apply func(protocol.Val
 	}
 	log.Printf("replication: connected to primary %s, streaming live writes", primaryAddr)
 
-	// Stream: every subsequent frame is a write command to apply locally.
+	// Stream: every subsequent frame is either the primary's heartbeat PING (which
+	// we ack to prove liveness) or a write command to apply locally.
 	for {
 		cmd, err := protocol.Decode(r)
 		if err != nil {
@@ -84,8 +86,35 @@ func streamOnce(ctx context.Context, primaryAddr string, apply func(protocol.Val
 			}
 			return fmt.Errorf("stream from primary %s: %w", primaryAddr, err)
 		}
+		if isHeartbeat(cmd) {
+			// Ack so the primary's heartbeat sees us as alive. It is one-way — the
+			// primary sends no reply to an ack — so writing here can't desync the
+			// inbound stream we're decoding.
+			if err := protocol.Encode(conn, replconfAck()); err != nil {
+				return fmt.Errorf("ack heartbeat to %s: %w", primaryAddr, err)
+			}
+			continue
+		}
 		apply(cmd)
 	}
+}
+
+// isHeartbeat reports whether a streamed frame is the primary's PING heartbeat
+// (rather than a write command to apply).
+func isHeartbeat(v protocol.Value) bool {
+	return v.Type == protocol.TypeArray && len(v.Array) > 0 &&
+		strings.EqualFold(string(v.Array[0].Bulk), "PING")
+}
+
+// replconfAck is the frame a replica sends back on each heartbeat so the primary
+// can tell it is alive. v1 carries no offset (we track none); the primary only
+// needs the ack's arrival time.
+func replconfAck() protocol.Value {
+	return protocol.Value{Type: protocol.TypeArray, Array: []protocol.Value{
+		{Type: protocol.TypeBulkString, Bulk: []byte("REPLCONF")},
+		{Type: protocol.TypeBulkString, Bulk: []byte("ACK")},
+		{Type: protocol.TypeBulkString, Bulk: []byte("0")},
+	}}
 }
 
 // replicaofCommand is the handshake frame the replica sends to the primary. It

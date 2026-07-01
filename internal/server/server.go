@@ -64,6 +64,15 @@ type Server struct {
 // actually doubled.
 const autoRewriteInterval = time.Second
 
+// replicaHeartbeatInterval is how often a primary PINGs its replicas, and
+// replicaAckTimeout is how long a replica may go without acking before the primary
+// logs a warning. Matches the Day-16 spec (ping every 5s, warn after 30s of
+// silence — i.e. six missed heartbeats).
+const (
+	replicaHeartbeatInterval = 5 * time.Second
+	replicaAckTimeout        = 30 * time.Second
+)
+
 // Option configures a Server at construction time. Options keep New backward
 // compatible: callers that want the default (no persistence) pass none.
 type Option func(*Server)
@@ -176,6 +185,16 @@ func (s *Server) Serve(ctx context.Context) error {
 		close(replicaDone)
 	}
 
+	// A primary probes its replicas with a PING every few seconds and warns about
+	// any that stop acking — a liveness check on the replication stream. Runs for
+	// the server's lifetime like the goroutines above; a no-op on a server that has
+	// no replicas (an idle ticker), so it is safe to always run.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		s.runReplicaHeartbeat(ctx)
+	}()
+
 	// wg tracks live connection goroutines so we can wait them out on shutdown
 	// rather than yanking the process out from under in-flight requests.
 	var wg sync.WaitGroup
@@ -204,7 +223,23 @@ func (s *Server) Serve(ctx context.Context) error {
 	<-expiryDone
 	<-rewriteDone
 	<-replicaDone
+	<-heartbeatDone
 	return nil
+}
+
+// runReplicaHeartbeat pings connected replicas on a fixed interval and warns about
+// any that have gone silent, until ctx is cancelled. See Replicas.Heartbeat.
+func (s *Server) runReplicaHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(replicaHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.replicas.Heartbeat(replicaAckTimeout)
+		}
+	}
 }
 
 // runAutoRewrite periodically compacts the append-only log, until ctx is

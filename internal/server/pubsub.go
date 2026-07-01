@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ThatDeparted2061/mini-redis-go/internal/cmd"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
@@ -47,11 +48,26 @@ func (s *Server) serve(cs *connState, request protocol.Value) bool {
 		// Handled here, not via cmd.Dispatch, because (like SUBSCRIBE) it acts on
 		// the CONNECTION: it turns this socket into a replica feed.
 		return s.replicaof(cs)
+	case "REPLCONF":
+		// A replica acks the primary's heartbeat with REPLCONF ACK. It is one-way:
+		// record the ack and send NO reply, or the reply would land in the replica's
+		// inbound stream and desync it. A REPLCONF from an ordinary client just gets OK.
+		if cs.replica != nil {
+			cs.replica.Acked()
+			return true
+		}
+		return cs.write(okVal()) == nil
 	case "QUIT":
 		// QUIT acknowledges and closes, in any mode.
 		_ = cs.write(okVal())
 		return false
 	default:
+		// A read-only replica refuses writes from ordinary clients: its data comes
+		// only from the primary's stream (which goes through Dispatch, not here).
+		// Reads fall through to apply as usual — a replica is eventually consistent.
+		if s.primaryAddr != "" && cmd.IsWrite(name) {
+			return cs.write(errorVal("READONLY You can't write against a read only replica.")) == nil
+		}
 		return cs.write(s.apply(request)) == nil
 	}
 }

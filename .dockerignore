@@ -1,0 +1,10 @@
+# Keep the build context small and the mod-download layer cacheable.
+.git
+.github
+.serena
+.claude
+graphify-out
+deploy
+demo
+*.aof
+appendonly.aof*

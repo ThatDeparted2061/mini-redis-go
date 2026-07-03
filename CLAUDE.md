@@ -244,10 +244,16 @@ spreads distinct keys across most shards).
 > and starts on boot. Localhost-only is deliberate — the server has **no `AUTH`
 > yet**, so 6380 must never be public; reach it over an SSH tunnel
 > (`ssh -L 6380:localhost:6380 …`).
+> `deploy/Dockerfile` is a real multi-stage build: a `golang:1.26-alpine` stage
+> compiles a static `CGO_ENABLED=0` binary, and the final image is
+> `distroless/static-debian12` running as the `nonroot` user with the AOF on a
+> `/data` volume — a ~4-5 MB image with no shell or package manager. A
+> `.dockerignore` keeps the build context (and the `go mod download` layer cache)
+> small.
 > **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
 > unattended-upgrades) and actually deploy the binary + unit onto it. The rest of
-> `deploy/` (Dockerfile, compose, Caddy, Grafana/Prometheus, backup, docs,
-> RUNBOOK) is still empty 0-byte scaffolding that runs ahead of the server.
+> `deploy/` (compose, Caddy, Grafana/Prometheus, backup, docs, RUNBOOK) is still
+> empty 0-byte scaffolding that runs ahead of the server.
 
 ## Architecture
 

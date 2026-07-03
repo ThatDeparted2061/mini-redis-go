@@ -15,6 +15,7 @@ import (
 
 func main() {
 	port := flag.String("port", "6380", "TCP port to listen on")
+	bind := flag.String("bind", "", `interface to bind (empty = all interfaces; use "127.0.0.1" to accept only local/tunneled connections)`)
 	appendOnly := flag.Bool("appendonly", true, "persist writes to an append-only file and recover them on restart")
 	aofPath := flag.String("aof-path", persistence.DefaultFilename, "path to the append-only file")
 	appendFsync := flag.String("appendfsync", "everysec", "AOF fsync policy: always | everysec | no")
@@ -40,7 +41,7 @@ func main() {
 
 	// Open the listener here (not inside the server) so a bad address or a
 	// port-in-use error is reported before we claim to be "listening".
-	addr := ":" + *port
+	addr := net.JoinHostPort(*bind, *port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", addr, err)

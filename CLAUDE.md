@@ -61,7 +61,7 @@ Keep the summary truthful: an empty stub file is "scaffolded", not "done".
 
 ## Project status
 
-_Last updated: 2026-07-01._
+_Last updated: 2026-07-03._
 
 ### Implemented
 - **RESP2 protocol** (`internal/protocol`): decoder, encoder, value model, with
@@ -192,9 +192,12 @@ _Last updated: 2026-07-01._
   bypassing the AOF), so there is nothing to reload. The documented upgrade
   (option 2) is a synthetic-command snapshot streamed before the live feed.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
-  `--appendonly` (default `true`), `--aof-path` (default `appendonly.aof`),
-  `--appendfsync` (default `everysec`) and `--replicaof` (default off; `"host port"`
-  makes the server a replica of that primary).
+  `--bind` (default empty = all interfaces; set `127.0.0.1` to accept only
+  local/tunneled connections), `--appendonly` (default `true`), `--aof-path`
+  (default `appendonly.aof`), `--appendfsync` (default `everysec`) and
+  `--replicaof` (default off; `"host port"` makes the server a replica of that
+  primary). The listen address is `net.JoinHostPort(bind, port)`, so the empty
+  default reproduces the old `:port` (all interfaces) behavior unchanged.
 - **Tests**: `internal/cmd` unit tests (dispatch, lists, hashes, sets, expiry,
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
   resurrection of expired keys on write), `internal/persistence` unit tests
@@ -232,9 +235,19 @@ spreads distinct keys across most shards).
   backings the other types use can't provide that. Revisit once the store has a
   proper ordered structure.
 
-> Note: `deploy/` (Dockerfile, compose, systemd, Grafana/Prometheus, docs)
-> describes the intended production shape but runs ahead of the implemented
-> server above.
+> **Deployment (partial — deploying to a VPS is a TODO).** The server
+> cross-compiles to a single, statically linked `linux/arm64` binary
+> (`GOOS=linux GOARCH=arm64 go build ./cmd/server`), so shipping it is
+> copy-one-file-and-run — no Docker or runtime deps needed.
+> `deploy/systemd/mini-redis.service` is a real, sandboxed unit: it runs the
+> server as a low-privilege `mini-redis` user bound to `127.0.0.1`, auto-restarts,
+> and starts on boot. Localhost-only is deliberate — the server has **no `AUTH`
+> yet**, so 6380 must never be public; reach it over an SSH tunnel
+> (`ssh -L 6380:localhost:6380 …`).
+> **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
+> unattended-upgrades) and actually deploy the binary + unit onto it. The rest of
+> `deploy/` (Dockerfile, compose, Caddy, Grafana/Prometheus, backup, docs,
+> RUNBOOK) is still empty 0-byte scaffolding that runs ahead of the server.
 
 ## Architecture
 

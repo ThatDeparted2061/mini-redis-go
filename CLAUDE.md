@@ -265,8 +265,12 @@ spreads distinct keys across most shards).
 > `deploy/docs/ARCHITECTURE.md` is a real HLD (Mermaid): overview/non-goals,
 > system diagram, SET/replicated-SET/GET sequence diagrams, the async-replication
 > + AOF consistency/durability model, and failure modes (primary/replica crash,
-> partition, disk-full, OOM — what's lost vs. recovered). `deploy/docs/LLD.md` and
-> `CAPACITY.md` are still empty stubs.
+> partition, disk-full, OOM — what's lost vs. recovered). `deploy/docs/LLD.md` is
+> a real low-level design: package tree, Mermaid state machines (RESP parser,
+> connection mode, AOF replay), the concurrency model (32 shards, `writeMu` vs.
+> the not-yet-built single-writer log goroutine, per-replica/per-subscriber
+> streaming goroutines), and a measured memory model (`Entry` is 96 B, ~350 MB
+> for 1M×200 B keys). `deploy/docs/CAPACITY.md` is still an empty stub.
 > **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
 > unattended-upgrades) and actually push the image + deploy onto it, plus wire up
 > the real B2 + UptimeRobot accounts. The rest of `deploy/` (compose,

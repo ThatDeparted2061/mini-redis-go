@@ -256,10 +256,22 @@ spreads distinct keys across most shards).
 > reach-the-port (the localhost-only + SSH-tunnel decision; stunnel/TLS is the
 > post-AUTH upgrade), and `deploy/caddy/Caddyfile` is an HTTPS status-page
 > placeholder — Caddy is HTTP-only and cannot proxy the raw Redis TCP port.
+> `deploy/backup/backup.sh` is a real script (installed as
+> `/etc/cron.daily/backup-mini-redis`) that gzips the AOF nightly and pushes it
+> to Backblaze B2 via `rclone`, pruning copies older than 30 days; `RUNBOOK.md`
+> now has the six operational sections (from-zero deploy, updates, rollback,
+> disaster-recovery restore, ops tasks, incident log), and the README header
+> carries an UptimeRobot status/uptime badge (monitor id still a placeholder).
+> `deploy/docs/ARCHITECTURE.md` is a real HLD (Mermaid): overview/non-goals,
+> system diagram, SET/replicated-SET/GET sequence diagrams, the async-replication
+> + AOF consistency/durability model, and failure modes (primary/replica crash,
+> partition, disk-full, OOM — what's lost vs. recovered). `deploy/docs/LLD.md` and
+> `CAPACITY.md` are still empty stubs.
 > **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
-> unattended-upgrades) and actually push the image + deploy onto it. The rest of
-> `deploy/` (compose, Grafana/Prometheus, backup) is still empty 0-byte
-> scaffolding that runs ahead of the server.
+> unattended-upgrades) and actually push the image + deploy onto it, plus wire up
+> the real B2 + UptimeRobot accounts. The rest of `deploy/` (compose,
+> Grafana/Prometheus) is still empty 0-byte scaffolding that runs ahead of the
+> server.
 
 ## Architecture
 

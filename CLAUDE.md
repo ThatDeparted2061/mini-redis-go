@@ -239,21 +239,27 @@ spreads distinct keys across most shards).
 > cross-compiles to a single, statically linked `linux/arm64` binary
 > (`GOOS=linux GOARCH=arm64 go build ./cmd/server`), so shipping it is
 > copy-one-file-and-run — no Docker or runtime deps needed.
-> `deploy/systemd/mini-redis.service` is a real, sandboxed unit: it runs the
-> server as a low-privilege `mini-redis` user bound to `127.0.0.1`, auto-restarts,
-> and starts on boot. Localhost-only is deliberate — the server has **no `AUTH`
-> yet**, so 6380 must never be public; reach it over an SSH tunnel
-> (`ssh -L 6380:localhost:6380 …`).
 > `deploy/Dockerfile` is a real multi-stage build: a `golang:1.26-alpine` stage
 > compiles a static `CGO_ENABLED=0` binary, and the final image is
 > `distroless/static-debian12` running as the `nonroot` user with the AOF on a
 > `/data` volume — a ~4-5 MB image with no shell or package manager. A
 > `.dockerignore` keeps the build context (and the `go mod download` layer cache)
 > small.
+> `deploy/systemd/mini-redis.service` is a real unit that supervises a
+> `docker run` of that image (the container path): it publishes to
+> `127.0.0.1:6380:6380` (loopback only — **no `AUTH` yet**, so 6380 must never be
+> public; reach it over an SSH tunnel), bind-mounts `/var/lib/mini-redis` for the
+> AOF (an `ExecStartPre` chowns it to uid 65532 so the container's nonroot user
+> can write it), and auto-restarts. Isolation comes from Docker + the nonroot
+> container user rather than the systemd sandbox the earlier bare-binary variant
+> used (still in git history). `deploy/RUNBOOK.md` documents deploy/operate/
+> reach-the-port (the localhost-only + SSH-tunnel decision; stunnel/TLS is the
+> post-AUTH upgrade), and `deploy/caddy/Caddyfile` is an HTTPS status-page
+> placeholder — Caddy is HTTP-only and cannot proxy the raw Redis TCP port.
 > **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
-> unattended-upgrades) and actually deploy the binary + unit onto it. The rest of
-> `deploy/` (compose, Caddy, Grafana/Prometheus, backup, docs, RUNBOOK) is still
-> empty 0-byte scaffolding that runs ahead of the server.
+> unattended-upgrades) and actually push the image + deploy onto it. The rest of
+> `deploy/` (compose, Grafana/Prometheus, backup) is still empty 0-byte
+> scaffolding that runs ahead of the server.
 
 ## Architecture
 

@@ -1,0 +1,23 @@
+# Caddy gives you a real domain with automatic HTTPS (Let's Encrypt) for free.
+#
+# IMPORTANT: Caddy speaks HTTP. Redis (port 6380) is a raw TCP protocol, so a
+# stock Caddy build CANNOT reverse-proxy the Redis port. This config is only for
+# an HTTP status page + TLS. The raw Redis port stays localhost-only (reach it
+# over an SSH tunnel) until AUTH + TLS exist — see deploy/RUNBOOK.md.
+#
+# Point an A record for this domain at the VPS IP first, then:
+#   sudo apt install caddy
+#   sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile   # edit the domain
+#   sudo systemctl reload caddy
+
+# Replace with your real domain (its A record must point at this VPS).
+redis.example.com {
+	# Automatic HTTPS is on by default. Minimal health/status endpoint:
+	respond /health "ok" 200
+
+	# No HTTP metrics endpoint exists yet. Once internal/metrics ships a /metrics
+	# handler (say on :9121), uncomment to expose it behind TLS:
+	# reverse_proxy /metrics localhost:9121
+
+	respond "mini-redis-go" 200
+}

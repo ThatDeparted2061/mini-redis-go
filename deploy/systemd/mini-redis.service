@@ -1,34 +1,48 @@
+# Docker-based deployment: systemd supervises a `docker run` of the published
+# image (the container path — Day 3). Isolation here comes from Docker plus the
+# container's nonroot user (uid 65532, set in the Dockerfile), rather than the
+# systemd sandbox the old bare-binary unit used (NoNewPrivileges / ProtectSystem
+# / …) — that variant lives in git history if you prefer running the raw binary.
+#
+# One-time host setup:
+#   sudo usermod -aG docker harsh          # the unit's User must be able to run docker
+#   (the AOF dir is created + chowned by ExecStartPre below — no manual step)
 # Install:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mini-redis
-#   sudo install -m755 mini-redis /usr/local/bin/mini-redis
 #   sudo cp deploy/systemd/mini-redis.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now mini-redis
-# Reach it (no public port): ssh -L 6380:localhost:6380 you@vps  →  redis-cli -p 6380
+#   systemctl status mini-redis ; journalctl -u mini-redis -f
+# Reach it (no public port, no AUTH yet): ssh -L 6380:localhost:6380 you@vps
 
 [Unit]
-Description=mini-redis-go server
-After=network-online.target
+Description=Mini-Redis (Go)
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
-User=mini-redis
-Group=mini-redis
-# Bind localhost only — the server has no AUTH yet, so 6380 must never be public.
-# Connect over an SSH tunnel. Widen --bind only after adding auth.
-ExecStart=/usr/local/bin/mini-redis --bind 127.0.0.1 --port 6380 \
-  --aof-path /var/lib/mini-redis/appendonly.aof --appendfsync everysec
 Restart=on-failure
-RestartSec=1
+RestartSec=5s
+LimitNOFILE=65536
+# Must be a member of the docker group (see one-time setup above).
+User=harsh
 
-# systemd creates and owns /var/lib/mini-redis (the AOF lives here).
-StateDirectory=mini-redis
+# The AOF lives on a host bind-mount; the container writes it as uid 65532
+# (nonroot), so the host dir must be owned by that uid. A bind-mount keeps host
+# ownership (unlike a named volume), so create + chown it here. `+` runs this
+# one line as root regardless of User=.
+ExecStartPre=+/usr/bin/install -d -m 0700 -o 65532 -g 65532 /var/lib/mini-redis
+ExecStartPre=-/usr/bin/docker stop mini-redis
+ExecStartPre=-/usr/bin/docker rm mini-redis
 
-# Sandboxing: run with the least privilege the server needs.
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
+# -p 127.0.0.1:6380:6380 publishes to LOOPBACK ONLY. The server has no AUTH yet,
+# so the port must never be public — reach it over an SSH tunnel. Do NOT change
+# this to -p 6380:6380 until AUTH (and ideally TLS) exist. See deploy/RUNBOOK.md.
+ExecStart=/usr/bin/docker run --rm --name mini-redis \
+  -p 127.0.0.1:6380:6380 \
+  -v /var/lib/mini-redis:/data \
+  thatdeparted2061/mini-redis-go:1.0
+ExecStop=/usr/bin/docker stop mini-redis
 
 [Install]
 WantedBy=multi-user.target

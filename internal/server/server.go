@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/cmd"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/metrics"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/persistence"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/replication"
@@ -56,6 +59,10 @@ type Server struct {
 	// primaryAddr, when set (--replicaof), makes this server a REPLICA: Serve
 	// launches a goroutine that streams the primary's writes into the local db.
 	primaryAddr string
+
+	// metricsAddr, when set (--metrics-addr), makes Serve expose a Prometheus
+	// /metrics endpoint on that address. Empty leaves metrics recording off.
+	metricsAddr string
 }
 
 // autoRewriteInterval is how often the background compactor checks whether the
@@ -96,6 +103,13 @@ func WithFsync(mode persistence.FsyncMode) Option {
 // server as a standalone primary.
 func WithReplicaOf(addr string) Option {
 	return func(s *Server) { s.primaryAddr = addr }
+}
+
+// WithMetrics exposes a Prometheus /metrics endpoint on addr (e.g. ":9091") for
+// the server's lifetime. An empty addr disables both the endpoint and the hot-path
+// recording.
+func WithMetrics(addr string) Option {
+	return func(s *Server) { s.metricsAddr = addr }
 }
 
 // New builds a Server around an already-open listener and a fresh, empty
@@ -145,6 +159,34 @@ func (s *Server) Serve(ctx context.Context) error {
 		log.Println("shutting down, closing listener")
 		_ = s.ln.Close()
 	}()
+
+	// Prometheus /metrics endpoint, when --metrics-addr is set. Init wires the
+	// live-state gauges (keys, replication lag) to this server and flips recording
+	// on; the HTTP server is shut down when ctx is cancelled. metricsDone stays
+	// closed when metrics are off, so the drain below is a no-op there.
+	metricsDone := make(chan struct{})
+	if s.metricsAddr != "" {
+		metrics.Init(
+			func() float64 { return float64(s.db.KeyCount()) },
+			s.replicas.LagSeconds,
+		)
+		mx := &http.Server{Addr: s.metricsAddr, Handler: metrics.Handler()}
+		go func() {
+			if err := mx.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("metrics server: %v", err)
+			}
+		}()
+		go func() {
+			defer close(metricsDone)
+			<-ctx.Done()
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = mx.Shutdown(shutCtx)
+		}()
+		log.Printf("metrics: serving /metrics on %s", s.metricsAddr)
+	} else {
+		close(metricsDone)
+	}
 
 	// Active expiry runs for the server's lifetime, reclaiming keys whose TTL
 	// elapsed without being accessed (lazy expiry alone would leak those). It
@@ -228,6 +270,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	<-rewriteDone
 	<-replicaDone
 	<-heartbeatDone
+	<-metricsDone
 	return nil
 }
 
@@ -348,9 +391,31 @@ func (s *Server) loadAOF() error {
 // Only non-error replies are recorded: a command that failed (wrong arguments,
 // WRONGTYPE, ...) changed nothing, so there is nothing to persist or propagate.
 func (s *Server) apply(request protocol.Value) protocol.Value {
+	name := commandName(request)
+	start := time.Now()
+	reply := s.applyRecord(request, name)
+
+	// Record the command for metrics. The label is the upper-cased name only for
+	// registered commands; anything else collapses to "unknown" so a client
+	// spraying garbage names cannot explode the metric's label cardinality.
+	label := "unknown"
+	if cmd.Known(name) {
+		label = strings.ToUpper(name)
+	}
+	result := "ok"
+	if reply.Type == protocol.TypeError {
+		result = "error"
+	}
+	metrics.ObserveCommand(label, result, time.Since(start))
+	return reply
+}
+
+// applyRecord runs the command against the store and, for successful writes,
+// records it downstream (AOF + replicas). See apply for the metrics wrapper.
+func (s *Server) applyRecord(request protocol.Value, name string) protocol.Value {
 	// Fast lock-free path: read-only commands, and writes when there is neither an
 	// AOF to append to nor a replica to stream to, need no ordering guarantee.
-	if !cmd.IsWrite(commandName(request)) || (s.aof == nil && !s.replicas.Any()) {
+	if !cmd.IsWrite(name) || (s.aof == nil && !s.replicas.Any()) {
 		return cmd.Dispatch(s.db, request)
 	}
 

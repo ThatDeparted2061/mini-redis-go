@@ -1,9 +1,12 @@
 # mini-redis-go
 
 <!-- UptimeRobot: replace mXXXXXXXXX-YYYY (badge monitor id) and the status-page
-     slug after you create the TCP monitor for the VPS. See deploy/RUNBOOK.md. -->
+     slug after you create the TCP monitor for the VPS. See deploy/RUNBOOK.md.
+     Grafana: replace YOUR_GRAFANA_URL once the public dashboard is shared (Day 3). -->
 [![Uptime](https://img.shields.io/uptimerobot/status/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
 [![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
+
+📊 **Live metrics dashboard:** [Grafana (public, read-only)](https://YOUR_GRAFANA_URL) — ops/sec by command, p50/p99 latency, AOF fsync latency, replication lag, memory, connections. Fed by the Prometheus `/metrics` endpoint (see [docs/CAPACITY.md](deploy/docs/CAPACITY.md) and `deploy/docker-compose.yml`).
 
 A small, from-scratch Redis-compatible server in Go. It speaks the real Redis
 wire protocol (RESP2), so standard clients — `redis-cli` and

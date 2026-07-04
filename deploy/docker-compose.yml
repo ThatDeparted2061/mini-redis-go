@@ -1,0 +1,48 @@
+# Observability stack for a single mini-redis node: the server, Prometheus
+# scraping its /metrics, and Grafana rendering the dashboard.
+#
+#   cd deploy && docker compose up -d
+#
+# Only Grafana (3000) and the Redis port (6380, loopback) are published to the
+# host; mini-redis:9091 and Prometheus stay on the internal compose network.
+services:
+  mini-redis:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["--port", "6380", "--appendonly=true", "--appendfsync", "everysec", "--metrics-addr", ":9091"]
+    ports:
+      - "127.0.0.1:6380:6380" # loopback only — no AUTH yet (see RUNBOOK)
+    volumes:
+      - aof:/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000" # dashboard UI; enable public sharing here (see README)
+    environment:
+      # Anonymous read-only access = the self-hosted equivalent of a public
+      # dashboard: anyone with the URL can view, nobody can edit or log in.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  aof:
+  prom:
+  grafana:

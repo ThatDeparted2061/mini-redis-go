@@ -1,0 +1,11 @@
+# Prometheus scrape config for mini-redis. Prometheus and mini-redis share the
+# compose network (deploy/docker-compose.yml), so the target is the service name
+# on its metrics port — no host publishing needed.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: mini-redis
+    static_configs:
+      - targets: ["mini-redis:9091"]

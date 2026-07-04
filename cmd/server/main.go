@@ -20,6 +20,7 @@ func main() {
 	aofPath := flag.String("aof-path", persistence.DefaultFilename, "path to the append-only file")
 	appendFsync := flag.String("appendfsync", "everysec", "AOF fsync policy: always | everysec | no")
 	replicaOf := flag.String("replicaof", "", `replicate from a primary, given as "host port" (e.g. --replicaof "127.0.0.1 6380")`)
+	metricsAddr := flag.String("metrics-addr", ":9091", `address for the Prometheus /metrics endpoint (empty to disable)`)
 	flag.Parse()
 
 	fsyncMode, err := persistence.ParseFsyncMode(*appendFsync)
@@ -65,6 +66,10 @@ func main() {
 	if primaryAddr != "" {
 		opts = append(opts, server.WithReplicaOf(primaryAddr))
 		log.Printf("replica mode: streaming live writes from primary %s", primaryAddr)
+	}
+	if *metricsAddr != "" {
+		opts = append(opts, server.WithMetrics(*metricsAddr))
+		log.Printf("metrics: Prometheus /metrics on %s", *metricsAddr)
 	}
 
 	srv := server.New(ln, opts...)

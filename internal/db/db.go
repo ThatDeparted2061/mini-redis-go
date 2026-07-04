@@ -55,6 +55,21 @@ func New() *DB {
 // handed the DB) can reach the broker without a separate plumbing path.
 func (db *DB) PubSub() *Broker { return db.pubsub }
 
+// KeyCount returns the number of keys across all shards, locking one shard at a
+// time (like Snapshot and active expiry) so it never freezes the whole keyspace.
+// The count may briefly include keys whose TTL has elapsed but which no read or
+// the reaper has evicted yet — close enough for a scraped gauge.
+func (db *DB) KeyCount() int {
+	n := 0
+	for i := range db.shards {
+		sh := &db.shards[i]
+		sh.mu.RLock()
+		n += len(sh.data)
+		sh.mu.RUnlock()
+	}
+	return n
+}
+
 // cloneBytes returns an independent copy of b so the store owns its data outright
 // rather than aliasing a caller's buffer (ultimately the decoder's read buffer),
 // which could change out from under us if reused.

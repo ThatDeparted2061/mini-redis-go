@@ -100,6 +100,15 @@ func IsWrite(name string) bool {
 	return ok
 }
 
+// Known reports whether name (in any case) is a registered command. The server
+// uses it to bound metric label cardinality: an unrecognised name is recorded as
+// "unknown" rather than as its own series, so a client spraying garbage command
+// names can't blow up the metrics registry.
+func Known(name string) bool {
+	_, ok := commands[strings.ToUpper(name)]
+	return ok
+}
+
 // Dispatch routes a decoded client request to the right handler and returns the
 // reply to send back.
 //

@@ -191,12 +191,27 @@ _Last updated: 2026-07-03._
   AOF (client writes are refused; the primary's stream is applied via `Dispatch`,
   bypassing the AOF), so there is nothing to reload. The documented upgrade
   (option 2) is a synthetic-command snapshot streamed before the live feed.
+- **Observability — Prometheus metrics** (`internal/metrics/metrics.go`): a
+  `/metrics` endpoint (default `--metrics-addr :9091`, empty disables) exposing
+  `mini_redis_commands_total{cmd,result}` + `_command_duration_seconds{cmd}`
+  (instrumented in `server.apply`, unknown names collapsed to `"unknown"` via
+  `cmd.Known` to bound label cardinality), `_aof_bytes_written_total` +
+  `_aof_fsync_duration_seconds` (a `countingWriter` and an `fsync` helper in
+  `persistence/aof.go`), and gauges `_keys_total` (`db.KeyCount`), `_memory_bytes`
+  (Go `HeapAlloc`), `_connections_active` (bumped in `server.handle`) and
+  `_replication_lag_seconds{replica}` (`Replicas.LagSeconds`, via a custom
+  collector so replica series appear/vanish with connections). Recording is gated
+  by an `enabled` flag so a server without `--metrics-addr` pays nothing on the
+  hot path. `metrics.Init` is idempotent (sync.Once) so tests can build many
+  servers. Measured on an M4: ~97k SET/GET ops/s (no AOF, no pipeline), ~73k with
+  `everysec` — see `deploy/docs/CAPACITY.md`.
 - **Entrypoint** (`cmd/server/main.go`): `--port` (default `6380`),
   `--bind` (default empty = all interfaces; set `127.0.0.1` to accept only
   local/tunneled connections), `--appendonly` (default `true`), `--aof-path`
-  (default `appendonly.aof`), `--appendfsync` (default `everysec`) and
+  (default `appendonly.aof`), `--appendfsync` (default `everysec`),
   `--replicaof` (default off; `"host port"` makes the server a replica of that
-  primary). The listen address is `net.JoinHostPort(bind, port)`, so the empty
+  primary) and `--metrics-addr` (default `:9091`; empty disables the Prometheus
+  endpoint). The listen address is `net.JoinHostPort(bind, port)`, so the empty
   default reproduces the old `:port` (all interfaces) behavior unchanged.
 - **Tests**: `internal/cmd` unit tests (dispatch, lists, hashes, sets, expiry,
   WRONGTYPE), `internal/db` white-box expiry tests (lazy/active eviction,
@@ -222,7 +237,6 @@ _Last updated: 2026-07-03._
 spreads distinct keys across most shards).
 
 ### Scaffolded (not yet implemented — empty stub files)
-- Metrics: `internal/metrics/metrics.go`.
 - Tests: `tests/chaos/*`.
 - Note: `internal/cmd/replication.go` is a vestigial stub — `REPLICAOF` is handled
   at the connection level (`internal/server/replication.go`), not as a `cmd`
@@ -270,12 +284,20 @@ spreads distinct keys across most shards).
 > connection mode, AOF replay), the concurrency model (32 shards, `writeMu` vs.
 > the not-yet-built single-writer log goroutine, per-replica/per-subscriber
 > streaming goroutines), and a measured memory model (`Entry` is 96 B, ~350 MB
-> for 1M×200 B keys). `deploy/docs/CAPACITY.md` is still an empty stub.
+> for 1M×200 B keys). `deploy/docs/CAPACITY.md` is a real capacity model: measured
+> per-node throughput, network-bandwidth ceiling, the memory model reused from the
+> LLD, a 1M-QPS/50M-key fleet sizing (~6×16-core/32 GB, throughput-bound, math
+> shown), the bottleneck progression (AOF fsync → single-primary → partitioning),
+> and a ~$240/mo cost projection. `deploy/docker-compose.yml` runs the observability
+> stack (mini-redis + Prometheus scraping `:9091` + Grafana with anonymous-viewer
+> public access), `deploy/prometheus/prometheus.yml` is the scrape config,
+> `deploy/grafana/` holds provisioning (datasource + dashboard loader) and a
+> committed dashboard JSON (ops/sec, p50/p99 latency, fsync latency, replication
+> lag, memory, connections), and the README carries a placeholder public Grafana URL.
 > **Still TODO:** provision + harden a VPS (SSH keys-only, `ufw`, `fail2ban`,
 > unattended-upgrades) and actually push the image + deploy onto it, plus wire up
-> the real B2 + UptimeRobot accounts. The rest of `deploy/` (compose,
-> Grafana/Prometheus) is still empty 0-byte scaffolding that runs ahead of the
-> server.
+> the real B2 + UptimeRobot accounts and share the real Grafana dashboard URL. The
+> chaos test suite (`tests/chaos/`) is still empty scaffolding.
 
 ## Architecture
 

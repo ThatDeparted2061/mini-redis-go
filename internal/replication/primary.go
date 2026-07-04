@@ -166,6 +166,21 @@ func (r *Replicas) StaleReplicas(staleAfter time.Duration) []string {
 	return stale
 }
 
+// LagSeconds returns, per replica (keyed by its remote address), how long since
+// it last acked a heartbeat — the replication-lag metric. It is a coarse proxy:
+// it measures liveness of the ack stream, not the exact staleness of the
+// replica's data, which v1 has no way to report without a per-write ack protocol.
+func (r *Replicas) LagSeconds() map[string]float64 {
+	now := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]float64, len(r.reps))
+	for _, rep := range r.reps {
+		out[rep.addr] = rep.sinceAck(now).Seconds()
+	}
+	return out
+}
+
 // pingCommand is the heartbeat frame the primary streams to replicas.
 func pingCommand() protocol.Value {
 	return protocol.Value{Type: protocol.TypeArray, Array: []protocol.Value{

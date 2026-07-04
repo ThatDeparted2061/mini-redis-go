@@ -22,13 +22,26 @@ package persistence
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/ThatDeparted2061/mini-redis-go/internal/metrics"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 )
+
+// countingWriter wraps the AOF's file so every byte flushed through the bufio
+// buffer is tallied into the aof_bytes_written metric. It sits below the buffer,
+// so it sees the coalesced, flushed writes — i.e. real bytes hitting the OS.
+type countingWriter struct{ w io.Writer }
+
+func (c countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	metrics.AddAOFBytes(n)
+	return n, err
+}
 
 // DefaultFilename is the conventional name for the log, matching Redis's own
 // appendonly.aof so the file is recognisable.
@@ -133,7 +146,7 @@ func Open(path string, mode FsyncMode) (*AOF, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &AOF{f: f, w: bufio.NewWriter(f), mode: mode}
+	a := &AOF{f: f, w: bufio.NewWriter(countingWriter{f}), mode: mode}
 	// Seed the rewrite baseline with the size of the log we're continuing, so a
 	// freshly-started server measures growth from what it recovered, not from
 	// zero.
@@ -161,7 +174,7 @@ func (a *AOF) syncEverySec() {
 			return
 		case <-t.C:
 			a.mu.Lock()
-			err := a.f.Sync()
+			err := fsync(a.f)
 			a.mu.Unlock()
 			if err != nil {
 				log.Printf("aof everysec fsync: %v", err)
@@ -188,9 +201,20 @@ func (a *AOF) Append(cmd protocol.Value) error {
 		return err
 	}
 	if a.mode == FsyncAlways {
-		return a.f.Sync()
+		return fsync(a.f)
 	}
 	return nil
+}
+
+// fsync flushes the file to disk and records how long it took (the fsync-latency
+// metric). Both runtime fsync paths — the inline FsyncAlways above and the
+// everysec ticker — go through here; the shutdown fsync in Close is skipped since
+// it is not a steady-state signal.
+func fsync(f *os.File) error {
+	start := time.Now()
+	err := f.Sync()
+	metrics.ObserveFsync(time.Since(start))
+	return err
 }
 
 // Flush pushes any buffered bytes out to the operating system. With the current

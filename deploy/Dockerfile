@@ -28,6 +28,9 @@ COPY --from=builder /usr/local/bin/mini-redis /usr/local/bin/mini-redis
 COPY --from=builder --chown=65532:65532 /data /data
 
 EXPOSE 6380
+# 9091 = Prometheus /metrics (default --metrics-addr). Scraped over the compose
+# network; not published to the host in deploy/docker-compose.yml.
+EXPOSE 9091
 # 65532 = the 'nonroot' user baked into distroless. Run unprivileged.
 USER nonroot
 

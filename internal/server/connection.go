@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/ThatDeparted2061/mini-redis-go/internal/db"
+	"github.com/ThatDeparted2061/mini-redis-go/internal/metrics"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/protocol"
 	"github.com/ThatDeparted2061/mini-redis-go/internal/replication"
 )
@@ -91,6 +92,9 @@ func (cs *connState) writeRaw(frame []byte) error {
 // the connection is closed and any pub/sub subscriptions are torn down.
 func (s *Server) handle(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+
+	metrics.ConnOpened()
+	defer metrics.ConnClosed()
 
 	remote := conn.RemoteAddr()
 	log.Printf("connection opened: %s", remote)

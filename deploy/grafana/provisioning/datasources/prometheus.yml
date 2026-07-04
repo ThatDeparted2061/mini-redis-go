@@ -1,0 +1,11 @@
+# Auto-provision the Prometheus datasource so Grafana comes up wired to it, no
+# click-through setup. The URL is the Prometheus service on the compose network.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus # fixed uid so the committed dashboard JSON can reference it
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

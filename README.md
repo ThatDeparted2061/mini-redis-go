@@ -1,5 +1,10 @@
 # mini-redis-go
 
+<!-- UptimeRobot: replace mXXXXXXXXX-YYYY (badge monitor id) and the status-page
+     slug after you create the TCP monitor for the VPS. See deploy/RUNBOOK.md. -->
+[![Uptime](https://img.shields.io/uptimerobot/status/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
+[![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
+
 A small, from-scratch Redis-compatible server in Go. It speaks the real Redis
 wire protocol (RESP2), so standard clients — `redis-cli` and
 `github.com/redis/go-redis/v9` — talk to it unmodified, backed by our own

@@ -1,12 +1,11 @@
 # mini-redis-go
 
-<!-- Grafana: replace YOUR_GRAFANA_URL once the public dashboard is shared (Day 3). -->
 [![Chaos](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml/badge.svg)](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml)
 [![Uptime](https://img.shields.io/uptimerobot/status/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
 [![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
 [![Uptime alerts on Discord](https://img.shields.io/badge/uptime%20alerts-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/bhpZug8pQT)
 
-📊 **Live metrics dashboard:** [Grafana (public, read-only)](https://YOUR_GRAFANA_URL) — ops/sec by command, p50/p99 latency, AOF fsync latency, replication lag, memory, connections. Fed by the Prometheus `/metrics` endpoint (see [docs/CAPACITY.md](deploy/docs/CAPACITY.md) and `deploy/docker-compose.yml`).
+📊 **Live metrics dashboard:** [Grafana (public, read-only)](https://chippermole2812.grafana.net/public-dashboards/21b8a53af206414288cc757c5eabe0c2) — ops/sec by command, p50/p99 latency, AOF fsync latency, replication lag, memory, connections. Fed by the Prometheus `/metrics` endpoint (see [docs/CAPACITY.md](deploy/docs/CAPACITY.md) and `deploy/docker-compose.yml`).
 
 A small, from-scratch Redis-compatible server in Go. It speaks the real Redis
 wire protocol (RESP2), so standard clients — `redis-cli` and

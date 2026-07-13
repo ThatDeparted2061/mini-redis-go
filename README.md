@@ -24,6 +24,17 @@ production Redis is complex (a single write lock, a single-format AOF, no
 cluster mode), and it **calls those simplifications out** rather than hiding
 them — see [Known limitations](#known-limitations).
 
+## Documentation
+
+- [Architecture (HLD)](deploy/docs/ARCHITECTURE.md) — components, request-lifecycle
+  sequence diagrams, consistency/durability model, failure modes.
+- [Low-level design (LLD)](deploy/docs/LLD.md) — module tree, state machines,
+  concurrency model, memory layout.
+- [Capacity model](deploy/docs/CAPACITY.md) — measured throughput, network/memory
+  ceilings, fleet sizing, bottleneck progression, cost projection.
+- [Runbook](deploy/RUNBOOK.md) — deploy, update, rollback, disaster recovery,
+  routine ops, incident log.
+
 ## Quick start
 
 ```bash

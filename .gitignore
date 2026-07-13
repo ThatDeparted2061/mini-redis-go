@@ -13,3 +13,6 @@ graphify-out/
 # local-only tooling config — kept on-machine, never pushed
 CLAUDE.md
 .serena/
+
+# Grafana Cloud remote_write token — secret, never commit (see prometheus.yml)
+deploy/prometheus/grafana_token

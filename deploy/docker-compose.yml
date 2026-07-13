@@ -23,6 +23,7 @@ services:
     image: prom/prometheus:v2.54.1
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/grafana_token:/etc/prometheus/grafana_token:ro # git-ignored secret
       - prom:/prometheus
     restart: unless-stopped
 

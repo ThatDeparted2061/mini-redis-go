@@ -9,3 +9,14 @@ scrape_configs:
   - job_name: mini-redis
     static_configs:
       - targets: ["mini-redis:9091"]
+
+# Ship every scraped sample up to Grafana Cloud so a public dashboard there can
+# read them (Grafana Cloud can't reach a loopback/VPS-internal target itself).
+# The API token is NOT in this file: it lives in a git-ignored password_file
+# (deploy/prometheus/grafana_token) mounted into the container. Same config
+# works on the VPS — just drop the token file there too.
+remote_write:
+  - url: https://prometheus-prod-43-prod-ap-south-1.grafana.net/api/prom/push
+    basic_auth:
+      username: "3367606"
+      password_file: /etc/prometheus/grafana_token

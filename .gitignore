@@ -9,3 +9,7 @@ data/
 
 # graphify knowledge-graph output (deployed via gh-pages, not source)
 graphify-out/
+
+# local-only tooling config — kept on-machine, never pushed
+CLAUDE.md
+.serena/

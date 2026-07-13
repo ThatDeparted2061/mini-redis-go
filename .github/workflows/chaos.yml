@@ -1,14 +1,43 @@
 name: Chaos
 
+# The fault-injection suite (tests/chaos): SIGKILL durability, replication
+# convergence, a tc-delayed slow replica, replica reconnect, and a full-tmpfs
+# disk. It runs on every push and PR. The netns/tc and tmpfs tests need root and
+# Linux kernel features, so the whole suite runs under sudo on ubuntu — where
+# they execute for real rather than self-skipping.
+
 on:
   push:
   pull_request:
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
+# One run per ref; a newer push cancels an in-flight one.
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - run: echo "Hello, GitHub Actions!"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # netem provides `tc qdisc ... netem delay`, used by the slow-replica test.
+      - name: Load the netem qdisc module
+        run: sudo modprobe sch_netem
+
+      # Fetch modules (incl. test-only deps like go-redis) as the normal user so
+      # the sudo'd build below reuses the cache instead of re-downloading as root.
+      - name: Prime module cache
+        run: go mod download
+
+      # Root is required for network namespaces (slow replica) and mounting a
+      # tmpfs (disk full). `-E env "PATH=$PATH"` carries the setup-go toolchain
+      # and the runner's caches into the root shell (sudo's secure_path would
+      # otherwise strip them).
+      - name: Run chaos suite (as root)
+        run: sudo -E env "PATH=$PATH" go test -v -timeout 20m ./tests/chaos/...

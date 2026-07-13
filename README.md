@@ -1,10 +1,9 @@
 # mini-redis-go
 
-<!-- UptimeRobot: replace mXXXXXXXXX-YYYY (badge monitor id) and the status-page
-     slug after you create the TCP monitor for the VPS. See deploy/RUNBOOK.md.
-     Grafana: replace YOUR_GRAFANA_URL once the public dashboard is shared (Day 3). -->
-[![Uptime](https://img.shields.io/uptimerobot/status/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
-[![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/mXXXXXXXXX-YYYY)](https://stats.uptimerobot.com/YOUR_PAGE)
+<!-- Grafana: replace YOUR_GRAFANA_URL once the public dashboard is shared (Day 3). -->
+[![Chaos](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml/badge.svg)](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml)
+[![Uptime](https://img.shields.io/uptimerobot/status/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
+[![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
 
 📊 **Live metrics dashboard:** [Grafana (public, read-only)](https://YOUR_GRAFANA_URL) — ops/sec by command, p50/p99 latency, AOF fsync latency, replication lag, memory, connections. Fed by the Prometheus `/metrics` endpoint (see [docs/CAPACITY.md](deploy/docs/CAPACITY.md) and `deploy/docker-compose.yml`).
 
@@ -417,8 +416,6 @@ take to close. Honesty here is the point: the gaps are as instructive as the cod
   chunks would make head inserts O(1).
 - **Metrics** (`internal/metrics`) and the `deploy/` production manifests are
   scaffolded but not wired to the running server.
-
-See `CLAUDE.md` for the detailed, always-current implementation status.
 
 ## License
 

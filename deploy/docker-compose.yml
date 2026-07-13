@@ -10,7 +10,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    command: ["--port", "6380", "--appendonly=true", "--appendfsync", "everysec", "--metrics-addr", ":9091"]
+    # Keep --aof-path pointing at the /data volume: overriding command drops the
+    # Dockerfile CMD's default, and the relative fallback isn't writable by nonroot.
+    command: ["--port", "6380", "--appendonly=true", "--appendfsync", "everysec", "--aof-path", "/data/appendonly.aof", "--metrics-addr", ":9091"]
     ports:
       - "127.0.0.1:6380:6380" # loopback only — no AUTH yet (see RUNBOOK)
     volumes:

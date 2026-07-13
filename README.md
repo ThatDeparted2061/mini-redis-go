@@ -4,6 +4,7 @@
 [![Chaos](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml/badge.svg)](https://github.com/ThatDeparted2061/mini-redis-go/actions/workflows/chaos.yml)
 [![Uptime](https://img.shields.io/uptimerobot/status/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
 [![30-day uptime](https://img.shields.io/uptimerobot/ratio/30/m803498513-e060c740430a3b7c7132d01b)](https://stats.uptimerobot.com/bOsSHg8LFd)
+[![Uptime alerts on Discord](https://img.shields.io/badge/uptime%20alerts-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/bhpZug8pQT)
 
 📊 **Live metrics dashboard:** [Grafana (public, read-only)](https://YOUR_GRAFANA_URL) — ops/sec by command, p50/p99 latency, AOF fsync latency, replication lag, memory, connections. Fed by the Prometheus `/metrics` endpoint (see [docs/CAPACITY.md](deploy/docs/CAPACITY.md) and `deploy/docker-compose.yml`).
 

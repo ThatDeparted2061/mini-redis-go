@@ -1,6 +1,7 @@
-// Package server ties the network layer to the command layer: it accepts TCP
-// connections and runs the per-connection request/response loop, dispatching
-// each decoded command against a single shared database.
+// Package server ties the network layer to the command layer: it accepts
+// connections (TCP and/or Unix domain sockets) and runs the per-connection
+// request/response loop, dispatching each decoded command against a single
+// shared database.
 package server
 
 import (
@@ -22,18 +23,18 @@ import (
 	"github.com/ThatDeparted2061/mini-redis-go/internal/replication"
 )
 
-// Server owns the TCP listener and the one shared database used by every
-// connection. There is exactly one DB instance for the whole process; all
-// concurrency safety lives inside db.DB (its RWMutex), so the Server itself
-// holds no locks of its own for the keyspace.
+// Server owns one or more listeners (TCP, Unix domain socket, or both) and the
+// one shared database used by every connection. There is exactly one DB instance
+// for the whole process; all concurrency safety lives inside db.DB (its RWMutex),
+// so the Server itself holds no locks of its own for the keyspace.
 //
 // When persistence is enabled (aofPath set) the Server also owns the append-only
 // log: it replays the log on startup to rebuild state, appends every successful
 // write to it while serving, and closes it on shutdown. writeMu serialises that
 // append against the database mutation it records — see apply.
 type Server struct {
-	ln net.Listener
-	db *db.DB
+	lns []net.Listener
+	db  *db.DB
 
 	// aofPath is the append-only log's path, or "" to run without persistence.
 	// aof is the open log, set during Serve once aofPath has been replayed.
@@ -112,13 +113,25 @@ func WithMetrics(addr string) Option {
 	return func(s *Server) { s.metricsAddr = addr }
 }
 
-// New builds a Server around an already-open listener and a fresh, empty
+// New builds a Server around a single already-open listener and a fresh, empty
 // database. The caller owns creating the listener (so it controls the address,
 // and so listen errors surface in main before we start serving). Options enable
 // optional features such as persistence (WithAOF).
+//
+// For TCP + Unix domain socket (or any multi-bind), use NewMulti.
 func New(ln net.Listener, opts ...Option) *Server {
+	return NewMulti([]net.Listener{ln}, opts...)
+}
+
+// NewMulti is like New but accepts on every given listener. Callers use this to
+// bind TCP and a Unix domain socket together, or either alone. At least one
+// listener is required.
+func NewMulti(lns []net.Listener, opts ...Option) *Server {
+	if len(lns) == 0 {
+		panic("server: NewMulti requires at least one listener")
+	}
 	s := &Server{
-		ln:       ln,
+		lns:      lns,
 		db:       db.New(),
 		replicas: replication.NewReplicas(),
 	}
@@ -151,13 +164,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		}()
 	}
 
-	// When the context is cancelled (e.g. on SIGINT) close the listener. That
-	// makes the blocking Accept below return immediately with ErrClosed, which
-	// is how we break out of the loop cleanly instead of polling.
+	// When the context is cancelled (e.g. on SIGINT) close every listener. That
+	// makes each blocking Accept return immediately with ErrClosed, which is how
+	// the accept loops exit cleanly instead of polling.
 	go func() {
 		<-ctx.Done()
-		log.Println("shutting down, closing listener")
-		_ = s.ln.Close()
+		log.Println("shutting down, closing listeners")
+		for _, ln := range s.lns {
+			_ = ln.Close()
+		}
 	}()
 
 	// Prometheus /metrics endpoint, when --metrics-addr is set. Init wires the
@@ -241,31 +256,41 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.runReplicaHeartbeat(ctx)
 	}()
 
-	// wg tracks live connection goroutines so we can wait them out on shutdown
-	// rather than yanking the process out from under in-flight requests.
-	var wg sync.WaitGroup
-	for {
-		conn, err := s.ln.Accept()
-		if err != nil {
-			// A listener closed by the shutdown goroutine above surfaces here
-			// as net.ErrClosed — the signal to stop accepting and drain.
-			if errors.Is(err, net.ErrClosed) {
-				break
+	// One accept loop per listener (TCP, Unix socket, …). connWG tracks live
+	// connection handlers so we can drain them on shutdown; acceptWG tracks the
+	// accept loops themselves so we know when no further connections will arrive.
+	var connWG sync.WaitGroup
+	var acceptWG sync.WaitGroup
+	for _, ln := range s.lns {
+		acceptWG.Add(1)
+		go func(ln net.Listener) {
+			defer acceptWG.Done()
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					// A listener closed by the shutdown goroutine above surfaces
+					// here as net.ErrClosed — the signal to stop accepting.
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
+					// Other accept errors (e.g. transient "too many open files")
+					// are not fatal: log and keep accepting.
+					log.Printf("accept error: %v", err)
+					continue
+				}
+				connWG.Add(1)
+				go func() {
+					defer connWG.Done()
+					s.handle(conn)
+				}()
 			}
-			// Other accept errors (e.g. transient "too many open files") are
-			// not fatal: log and keep accepting.
-			log.Printf("accept error: %v", err)
-			continue
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handle(conn)
-		}()
+		}(ln)
 	}
 
-	wg.Wait()
+	// Wait for every accept loop to exit (listeners closed), then drain in-flight
+	// connections rather than yanking the process out from under them.
+	acceptWG.Wait()
+	connWG.Wait()
 	<-expiryDone
 	<-rewriteDone
 	<-replicaDone

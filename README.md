@@ -80,11 +80,24 @@ All configuration is via command-line flags (`go run ./cmd/server --help`):
 
 | Flag            | Default          | Meaning                                                        |
 | --------------- | ---------------- | -------------------------------------------------------------- |
-| `--port`        | `6380`           | TCP port to listen on.                                         |
+| `--port`        | `6380`           | TCP port (`0` = kernel picks a free port).                     |
+| `--no-tcp`      | `false`          | Do not bind TCP (requires `--unixsocket`).                     |
+| `--unixsocket`  | *(off)*          | Unix domain socket path. Combine with TCP for dual bind.       |
 | `--appendonly`  | `true`           | Enable AOF persistence (log every write, replay on restart).   |
 | `--aof-path`    | `appendonly.aof` | Path to the append-only file.                                  |
 | `--appendfsync` | `everysec`       | fsync policy: `always`, `everysec`, or `no` (see below).       |
 | `--replicaof`   | *(off)*          | `"host port"` — run as a read-only replica of that primary.    |
+
+Transport examples (same RESP protocol on every listener):
+
+```bash
+go run ./cmd/server                                       # TCP only (default :6380)
+go run ./cmd/server --no-tcp --unixsocket /tmp/mini-redis.sock   # UDS only
+go run ./cmd/server --unixsocket /tmp/mini-redis.sock     # TCP + UDS
+
+redis-cli -p 6380                                         # TCP client
+redis-cli -s /tmp/mini-redis.sock                         # UDS client
+```
 
 ## Architecture
 
